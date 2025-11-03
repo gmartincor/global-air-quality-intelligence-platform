@@ -1,5 +1,6 @@
 # Project documentation (private)
 PROJECT_PROMPT.md
+docs/implementation/data_engineering_patterns_guide.md
 
 # Python
 __pycache__/
