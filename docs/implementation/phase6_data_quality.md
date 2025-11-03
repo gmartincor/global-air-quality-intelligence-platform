@@ -15,9 +15,28 @@
 
 ---
 
+## Architecture & Design Principles
+
+**Modular Structure**: Separate concerns into distinct modules
+- Expectation definitions (Bronze, Silver, Gold suites)
+- Validation runner (orchestration)
+- Metrics tracking (observability)
+- Airflow integration (scheduling)
+
+**SOLID Application**:
+- **SRP**: Each module has single responsibility (expectation creation, validation execution, metrics storage)
+- **OCP**: Add new expectations without modifying existing runner
+- **DIP**: Depend on Great Expectations abstraction, not implementation details
+
+**DRY**: Reuse validation logic across layers, centralize expectation configuration
+
+---
+
 ## Tasks Breakdown
 
 ### 6.1 Great Expectations Setup
+
+**Responsibility**: Configure Great Expectations context with datasources for Silver (S3) and Gold (PostgreSQL) layers
 
 **Directory Structure**:
 ```
@@ -25,13 +44,7 @@ src/data_quality/
 ├── great_expectations/
 │   ├── great_expectations.yml
 │   ├── expectations/
-│   │   ├── bronze_layer_suite.json
-│   │   ├── silver_layer_suite.json
-│   │   └── gold_layer_suite.json
 │   ├── checkpoints/
-│   │   ├── bronze_checkpoint.yml
-│   │   ├── silver_checkpoint.yml
-│   │   └── gold_checkpoint.yml
 │   └── plugins/
 └── validators/
     ├── __init__.py
@@ -39,559 +52,205 @@ src/data_quality/
     └── business_rules_validator.py
 ```
 
-**File**: `src/data_quality/great_expectations/great_expectations.yml`
-
-```yaml
-config_version: 3.0
-
-datasources:
-  silver_layer_s3:
-    class_name: Datasource
-    execution_engine:
-      class_name: SparkDFExecutionEngine
-    data_connectors:
-      default_runtime_data_connector:
-        class_name: RuntimeDataConnector
-        batch_identifiers:
-          - default_identifier_name
-
-  postgres_warehouse:
-    class_name: Datasource
-    execution_engine:
-      class_name: SqlAlchemyExecutionEngine
-      connection_string: postgresql://airflow:airflow@localhost:5432/air_quality_warehouse
-    data_connectors:
-      default_inferred_data_connector:
-        class_name: InferredAssetSqlDataConnector
-
-stores:
-  expectations_store:
-    class_name: ExpectationsStore
-    store_backend:
-      class_name: TupleFilesystemStoreBackend
-      base_directory: expectations/
-
-  validations_store:
-    class_name: ValidationsStore
-    store_backend:
-      class_name: TupleFilesystemStoreBackend
-      base_directory: validations/
-
-expectations_store_name: expectations_store
-validations_store_name: validations_store
-```
+**Configuration Requirements** (`great_expectations.yml`):
+- Configure two datasources:
+  - `silver_layer_s3`: SparkDFExecutionEngine for S3 data
+  - `postgres_warehouse`: SqlAlchemyExecutionEngine for PostgreSQL
+- Define stores for expectations and validations (filesystem-based)
+- Enable RuntimeDataConnector for programmatic batch creation
 
 ---
 
 ### 6.2 Expectation Suites
 
-**File**: `src/data_quality/expectations/bronze_suite.py`
+**Module**: `src/data_quality/expectations/`
 
-```python
-from great_expectations.core import ExpectationConfiguration
+**Responsibility**: Define data validation rules for each medallion layer (Bronze, Silver, Gold)
 
+**Bronze Layer Expectations** (`bronze_suite.py`):
+- Function: `create_bronze_layer_expectations() -> list[ExpectationConfiguration]`
+- Validations:
+  - Row count between 1,000 and 20,000,000
+  - NOT NULL: city_id, timestamp, pm25_value
+  - Regex patterns: city_id format (^[A-Z]{3}\d{3}$), country_code format (^[A-Z]{2}$)
 
-def create_bronze_layer_expectations() -> list[ExpectationConfiguration]:
-    return [
-        ExpectationConfiguration(
-            expectation_type="expect_table_row_count_to_be_between",
-            kwargs={
-                "min_value": 1000,
-                "max_value": 20000000
-            }
-        ),
-        ExpectationConfiguration(
-            expectation_type="expect_column_values_to_not_be_null",
-            kwargs={"column": "city_id"}
-        ),
-        ExpectationConfiguration(
-            expectation_type="expect_column_values_to_not_be_null",
-            kwargs={"column": "timestamp"}
-        ),
-        ExpectationConfiguration(
-            expectation_type="expect_column_values_to_not_be_null",
-            kwargs={"column": "pm25_value"}
-        ),
-        ExpectationConfiguration(
-            expectation_type="expect_column_values_to_match_regex",
-            kwargs={
-                "column": "city_id",
-                "regex": "^[A-Z]{3}\\d{3}$"
-            }
-        ),
-        ExpectationConfiguration(
-            expectation_type="expect_column_values_to_match_regex",
-            kwargs={
-                "column": "country_code",
-                "regex": "^[A-Z]{2}$"
-            }
-        ),
-    ]
-```
+**Silver Layer Expectations** (`silver_suite.py`):
+- Function: `create_silver_layer_expectations() -> list[ExpectationConfiguration]`
+- Validations:
+  - pm25_value range: [0, 500], 99% compliance
+  - pm10_value range: [0, 600], 99% compliance
+  - latitude/longitude ranges: [-90, 90], [-180, 180]
+  - aqi_category values in set: ["Good", "Moderate", "Unhealthy for Sensitive Groups", "Unhealthy", "Very Unhealthy", "Hazardous"]
+  - Composite uniqueness: (city_id, timestamp) 99.9% unique
+  - pm25_value mean between 5 and 150
 
-**File**: `src/data_quality/expectations/silver_suite.py`
-
-```python
-from great_expectations.core import ExpectationConfiguration
-
-
-def create_silver_layer_expectations() -> list[ExpectationConfiguration]:
-    return [
-        ExpectationConfiguration(
-            expectation_type="expect_column_values_to_be_between",
-            kwargs={
-                "column": "pm25_value",
-                "min_value": 0,
-                "max_value": 500,
-                "mostly": 0.99
-            }
-        ),
-        ExpectationConfiguration(
-            expectation_type="expect_column_values_to_be_between",
-            kwargs={
-                "column": "pm10_value",
-                "min_value": 0,
-                "max_value": 600,
-                "mostly": 0.99
-            }
-        ),
-        ExpectationConfiguration(
-            expectation_type="expect_column_values_to_be_between",
-            kwargs={
-                "column": "latitude",
-                "min_value": -90,
-                "max_value": 90
-            }
-        ),
-        ExpectationConfiguration(
-            expectation_type="expect_column_values_to_be_between",
-            kwargs={
-                "column": "longitude",
-                "min_value": -180,
-                "max_value": 180
-            }
-        ),
-        ExpectationConfiguration(
-            expectation_type="expect_column_values_to_be_in_set",
-            kwargs={
-                "column": "aqi_category",
-                "value_set": [
-                    "Good",
-                    "Moderate",
-                    "Unhealthy for Sensitive Groups",
-                    "Unhealthy",
-                    "Very Unhealthy",
-                    "Hazardous"
-                ]
-            }
-        ),
-        ExpectationConfiguration(
-            expectation_type="expect_column_values_to_be_unique",
-            kwargs={
-                "column": ["city_id", "timestamp"],
-                "mostly": 0.999
-            }
-        ),
-        ExpectationConfiguration(
-            expectation_type="expect_column_mean_to_be_between",
-            kwargs={
-                "column": "pm25_value",
-                "min_value": 5,
-                "max_value": 150
-            }
-        ),
-    ]
-```
-
-**File**: `src/data_quality/expectations/gold_suite.py`
-
-```python
-from great_expectations.core import ExpectationConfiguration
-
-
-def create_gold_layer_expectations() -> list[ExpectationConfiguration]:
-    return [
-        ExpectationConfiguration(
-            expectation_type="expect_column_values_to_not_be_null",
-            kwargs={"column": "measurement_key"}
-        ),
-        ExpectationConfiguration(
-            expectation_type="expect_column_values_to_be_unique",
-            kwargs={"column": "measurement_key"}
-        ),
-        ExpectationConfiguration(
-            expectation_type="expect_column_values_to_not_be_null",
-            kwargs={"column": "location_key"}
-        ),
-        ExpectationConfiguration(
-            expectation_type="expect_column_values_to_not_be_null",
-            kwargs={"column": "time_key"}
-        ),
-        ExpectationConfiguration(
-            expectation_type="expect_column_values_to_be_between",
-            kwargs={
-                "column": "aqi_value",
-                "min_value": 0,
-                "max_value": 500
-            }
-        ),
-        ExpectationConfiguration(
-            expectation_type="expect_compound_columns_to_be_unique",
-            kwargs={
-                "column_list": ["location_key", "measurement_timestamp"]
-            }
-        ),
-    ]
-```
+**Gold Layer Expectations** (`gold_suite.py`):
+- Function: `create_gold_layer_expectations() -> list[ExpectationConfiguration]`
+- Validations:
+  - NOT NULL + UNIQUE: measurement_key
+  - NOT NULL: location_key, time_key
+  - aqi_value range: [0, 500]
+  - Compound uniqueness: (location_key, measurement_timestamp)
 
 ---
 
 ### 6.3 Data Quality Runner
 
-**File**: `src/data_quality/quality_runner.py`
+**Module**: `src/data_quality/quality_runner.py`
 
+**Class**: `DataQualityRunner`
+
+**Responsibilities**:
+- Initialize Great Expectations context
+- Create expectation suites programmatically
+- Execute validations against datasources
+- Return structured results (success rate, expectation counts)
+
+**Key Methods**:
+- `__init__()`: Load GE context from project directory
+- `create_expectation_suite(suite_name, expectations)`: Create/update suite with expectation list
+- `run_validation(datasource_name, asset_name, suite_name, batch_data=None)`: Execute validation, return statistics
+- `setup_all_suites()`: Create Bronze, Silver, Gold suites using factory functions
+
+**Return Contract** (validation results):
 ```python
-from pathlib import Path
-from typing import Dict, Any
-import great_expectations as gx
-from great_expectations.core.batch import RuntimeBatchRequest
-
-from src.common.config import config
-from src.common.logger import setup_logger
-from src.data_quality.expectations.bronze_suite import create_bronze_layer_expectations
-from src.data_quality.expectations.silver_suite import create_silver_layer_expectations
-from src.data_quality.expectations.gold_suite import create_gold_layer_expectations
-
-logger = setup_logger(__name__)
-
-
-class DataQualityRunner:
-    
-    def __init__(self):
-        ge_root = Path(__file__).parent / "great_expectations"
-        self.context = gx.get_context(context_root_dir=str(ge_root))
-    
-    def create_expectation_suite(
-        self,
-        suite_name: str,
-        expectations: list
-    ):
-        try:
-            self.context.delete_expectation_suite(suite_name)
-        except:
-            pass
-        
-        suite = self.context.create_expectation_suite(
-            expectation_suite_name=suite_name,
-            overwrite_existing=True
-        )
-        
-        for expectation in expectations:
-            suite.add_expectation(expectation)
-        
-        self.context.save_expectation_suite(suite)
-        logger.info(f"Created expectation suite: {suite_name}")
-    
-    def run_validation(
-        self,
-        datasource_name: str,
-        asset_name: str,
-        suite_name: str,
-        batch_data: Any = None
-    ) -> Dict:
-        
-        if batch_data is not None:
-            batch_request = RuntimeBatchRequest(
-                datasource_name=datasource_name,
-                data_connector_name="default_runtime_data_connector",
-                data_asset_name=asset_name,
-                runtime_parameters={"batch_data": batch_data},
-                batch_identifiers={"default_identifier_name": "default_identifier"}
-            )
-            
-            validator = self.context.get_validator(
-                batch_request=batch_request,
-                expectation_suite_name=suite_name
-            )
-        else:
-            validator = self.context.get_validator(
-                datasource_name=datasource_name,
-                data_asset_name=asset_name,
-                expectation_suite_name=suite_name
-            )
-        
-        results = validator.validate()
-        
-        success_rate = results.statistics["success_percent"]
-        logger.info(f"Validation complete: {success_rate:.2f}% success")
-        
-        return {
-            "success": results.success,
-            "success_rate": success_rate,
-            "evaluated_expectations": results.statistics["evaluated_expectations"],
-            "successful_expectations": results.statistics["successful_expectations"],
-            "unsuccessful_expectations": results.statistics["unsuccessful_expectations"]
-        }
-    
-    def setup_all_suites(self):
-        self.create_expectation_suite(
-            "bronze_layer_suite",
-            create_bronze_layer_expectations()
-        )
-        self.create_expectation_suite(
-            "silver_layer_suite",
-            create_silver_layer_expectations()
-        )
-        self.create_expectation_suite(
-            "gold_layer_suite",
-            create_gold_layer_expectations()
-        )
-
-
-def main():
-    runner = DataQualityRunner()
-    runner.setup_all_suites()
-    
-    logger.info("All expectation suites created successfully")
-
-
-if __name__ == "__main__":
-    main()
+{
+    "success": bool,
+    "success_rate": float,
+    "evaluated_expectations": int,
+    "successful_expectations": int,
+    "unsuccessful_expectations": int
+}
 ```
 
 ---
 
 ### 6.4 Custom dbt Tests
 
-**File**: `src/transformation/dbt/tests/assert_aqi_range.sql`
+**Location**: `src/transformation/dbt/tests/`
 
-```sql
-SELECT *
-FROM {{ ref('fact_air_quality_measurements') }}
-WHERE aqi_value < 0 OR aqi_value > 500
-```
+**Purpose**: SQL-based data quality tests integrated with dbt workflow
 
-**File**: `src/transformation/dbt/tests/assert_no_future_dates.sql`
+**Test Files**:
 
-```sql
-SELECT *
-FROM {{ ref('fact_air_quality_measurements') }}
-WHERE measurement_timestamp > CURRENT_TIMESTAMP
-```
+1. **assert_aqi_range.sql**: Validate AQI values within [0, 500]
+   - Select invalid records from fact_air_quality_measurements
+   - Test fails if any rows returned
 
-**File**: `src/transformation/dbt/tests/assert_location_consistency.sql`
+2. **assert_no_future_dates.sql**: Prevent future timestamps
+   - Filter measurements with timestamp > CURRENT_TIMESTAMP
+   - Ensures data integrity
 
-```sql
-WITH location_changes AS (
-    SELECT
-        city_id,
-        COUNT(DISTINCT latitude) AS lat_count,
-        COUNT(DISTINCT longitude) AS lon_count
-    FROM {{ ref('stg_air_quality_measurements') }}
-    GROUP BY city_id
-)
+3. **assert_location_consistency.sql**: Detect location coordinate changes
+   - Identify cities with multiple lat/lon values (invalid state)
+   - Uses CTE to count distinct coordinates per city_id
 
-SELECT *
-FROM location_changes
-WHERE lat_count > 1 OR lon_count > 1
-```
-
-**File**: `src/transformation/dbt/macros/test_accepted_ratio.sql`
-
-```sql
-{% test accepted_ratio(model, column_name, condition, threshold=0.95) %}
-
-WITH validation AS (
-    SELECT
-        SUM(CASE WHEN {{ condition }} THEN 1 ELSE 0 END) AS valid_count,
-        COUNT(*) AS total_count
-    FROM {{ model }}
-),
-
-ratio AS (
-    SELECT
-        valid_count::FLOAT / NULLIF(total_count, 0) AS success_ratio
-    FROM validation
-)
-
-SELECT *
-FROM ratio
-WHERE success_ratio < {{ threshold }}
-
-{% endtest %}
-```
+**Custom Macro** (`macros/test_accepted_ratio.sql`):
+- Test: `accepted_ratio(model, column_name, condition, threshold=0.95)`
+- Purpose: Validate percentage of rows meeting condition exceeds threshold
+- Implementation: CTE-based ratio calculation with configurable threshold
 
 ---
 
 ### 6.5 Airflow Integration
 
-**File**: `src/orchestration/airflow/dags/data_quality_dag.py`
+**Module**: `src/orchestration/airflow/dags/data_quality_dag.py`
 
-```python
-from datetime import datetime, timedelta
-from airflow import DAG
-from airflow.operators.python import PythonOperator
+**Responsibility**: Schedule and orchestrate daily data quality validations
 
+**DAG Configuration**:
+- ID: `data_quality_validation`
+- Schedule: Daily at 4 AM (`0 4 * * *`)
+- Start date: 2024-01-01
+- Catchup: False
+- Retries: 1 (5-minute delay)
 
-default_args = {
-    "owner": "data-quality",
-    "retries": 1,
-    "retry_delay": timedelta(minutes=5),
-}
+**Tasks**:
 
+1. **validate_silver_layer** (PythonOperator):
+   - Function: `run_silver_validation()`
+   - Action: Execute Silver layer expectation suite
+   - Failure handling: Raise ValueError if success_rate < threshold
 
-def run_silver_validation(**context):
-    from src.data_quality.quality_runner import DataQualityRunner
-    
-    runner = DataQualityRunner()
-    results = runner.run_validation(
-        datasource_name="silver_layer_s3",
-        asset_name="air_quality",
-        suite_name="silver_layer_suite"
-    )
-    
-    if not results["success"]:
-        raise ValueError(f"Data quality check failed: {results['success_rate']}% success")
-    
-    return results
+2. **validate_gold_layer** (PythonOperator):
+   - Function: `run_gold_validation()`
+   - Action: Execute Gold layer expectation suite against PostgreSQL
+   - Failure handling: Raise ValueError if validation fails
 
-
-def run_gold_validation(**context):
-    from src.data_quality.quality_runner import DataQualityRunner
-    
-    runner = DataQualityRunner()
-    results = runner.run_validation(
-        datasource_name="postgres_warehouse",
-        asset_name="facts.fact_air_quality_measurements",
-        suite_name="gold_layer_suite"
-    )
-    
-    if not results["success"]:
-        raise ValueError(f"Data quality check failed: {results['success_rate']}% success")
-    
-    return results
-
-
-with DAG(
-    dag_id="data_quality_validation",
-    default_args=default_args,
-    description="Data quality validation pipeline",
-    schedule_interval="0 4 * * *",
-    start_date=datetime(2024, 1, 1),
-    catchup=False,
-    tags=["data-quality"],
-) as dag:
-    
-    validate_silver = PythonOperator(
-        task_id="validate_silver_layer",
-        python_callable=run_silver_validation,
-        provide_context=True,
-    )
-    
-    validate_gold = PythonOperator(
-        task_id="validate_gold_layer",
-        python_callable=run_gold_validation,
-        provide_context=True,
-    )
-    
-    validate_silver >> validate_gold
-```
+**Dependencies**: validate_silver >> validate_gold
 
 ---
 
 ### 6.6 Quality Metrics Tracking
 
-**File**: `src/data_quality/metrics_tracker.py`
+**Module**: `src/data_quality/metrics_tracker.py`
 
-```python
-from datetime import datetime
-from typing import Dict
-import psycopg2
+**Class**: `QualityMetricsTracker`
 
-from src.common.config import config
-from src.common.logger import setup_logger
+**Responsibilities**:
+- Create PostgreSQL table for quality metrics history
+- Record validation results with metadata
+- Query quality trends over time
 
-logger = setup_logger(__name__)
-
-
-class QualityMetricsTracker:
-    
-    def __init__(self):
-        self.conn = psycopg2.connect(
-            host=config.database.host,
-            port=config.database.port,
-            database=config.database.database,
-            user=config.database.user,
-            password=config.database.password
-        )
-        self._create_metrics_table()
-    
-    def _create_metrics_table(self):
-        with self.conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS data_quality_metrics (
-                    id SERIAL PRIMARY KEY,
-                    layer VARCHAR(50) NOT NULL,
-                    suite_name VARCHAR(100) NOT NULL,
-                    execution_timestamp TIMESTAMP NOT NULL,
-                    success BOOLEAN NOT NULL,
-                    success_rate DECIMAL(5, 2) NOT NULL,
-                    total_expectations INTEGER NOT NULL,
-                    successful_expectations INTEGER NOT NULL,
-                    failed_expectations INTEGER NOT NULL
-                )
-            """)
-            self.conn.commit()
-    
-    def record_validation_result(
-        self,
-        layer: str,
-        suite_name: str,
-        results: Dict
-    ):
-        with self.conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO data_quality_metrics (
-                    layer,
-                    suite_name,
-                    execution_timestamp,
-                    success,
-                    success_rate,
-                    total_expectations,
-                    successful_expectations,
-                    failed_expectations
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                layer,
-                suite_name,
-                datetime.utcnow(),
-                results["success"],
-                results["success_rate"],
-                results["evaluated_expectations"],
-                results["successful_expectations"],
-                results["unsuccessful_expectations"]
-            ))
-            self.conn.commit()
-        
-        logger.info(f"Recorded quality metrics for {layer}/{suite_name}")
-    
-    def get_quality_trend(self, layer: str, days: int = 7):
-        with self.conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    DATE(execution_timestamp) AS date,
-                    AVG(success_rate) AS avg_success_rate,
-                    MIN(success_rate) AS min_success_rate,
-                    MAX(success_rate) AS max_success_rate
-                FROM data_quality_metrics
-                WHERE layer = %s
-                  AND execution_timestamp >= CURRENT_DATE - INTERVAL '%s days'
-                GROUP BY DATE(execution_timestamp)
-                ORDER BY date DESC
-            """, (layer, days))
-            
-            return cur.fetchall()
+**Database Schema** (`data_quality_metrics`):
 ```
+id SERIAL PRIMARY KEY
+layer VARCHAR(50)
+suite_name VARCHAR(100)
+execution_timestamp TIMESTAMP
+success BOOLEAN
+success_rate DECIMAL(5,2)
+total_expectations INTEGER
+successful_expectations INTEGER
+failed_expectations INTEGER
+```
+
+**Key Methods**:
+- `__init__()`: Connect to PostgreSQL, create metrics table if not exists
+- `record_validation_result(layer, suite_name, results)`: Insert validation outcome
+- `get_quality_trend(layer, days=7)`: Query average/min/max quality scores by day
+
+---
+
+## Validation Steps
+
+### 1. Setup Expectation Suites
+```bash
+poetry run python -m src.data_quality.quality_runner
+```
+
+### 2. Run Quality Checks
+```bash
+poetry run python -m src.data_quality.quality_runner
+```
+
+### 3. Trigger Quality DAG
+```bash
+docker exec airflow-webserver airflow dags trigger data_quality_validation
+```
+
+### 4. Check Quality Metrics
+```sql
+SELECT * FROM data_quality_metrics ORDER BY execution_timestamp DESC LIMIT 10;
+```
+
+---
+
+## Deliverables Checklist
+
+- [ ] Great Expectations configured
+- [ ] Expectation suites (Bronze, Silver, Gold)
+- [ ] Custom dbt tests
+- [ ] Quality metrics tracking
+- [ ] Airflow quality validation DAG
+- [ ] Quality checks running successfully
+- [ ] Quality score >95%
+
+---
+
+## Next Phase
+
+Proceed to [Phase 7: Monitoring & Observability](./phase7_monitoring.md)
 
 ---
 

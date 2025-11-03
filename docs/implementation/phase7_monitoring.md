@@ -15,210 +15,127 @@
 
 ---
 
+## Architecture & Design Principles
+
+**Observability Stack**: Prometheus (metrics) → Grafana (visualization) → Alertmanager (notifications)
+
+**Modular Monitoring**:
+- Custom metrics exporter (application-level metrics)
+- System exporters (PostgreSQL, infrastructure)
+- Health check endpoint (liveness/readiness probes)
+
+**SOLID Application**:
+- **SRP**: Each exporter has single responsibility (pipeline metrics, database metrics, health checks)
+- **OCP**: Add new metrics without modifying existing exporters
+- **DIP**: Depend on Prometheus client abstraction, not implementation
+
+**DRY**: Centralize metric definitions, reuse Prometheus client library patterns
+
+**KISS**: Simple metric types (Counter, Gauge, Histogram), straightforward dashboard structure
+
+---
+
 ## Tasks Breakdown
 
 ### 7.1 Prometheus Configuration
 
-**File**: `infrastructure/monitoring/prometheus.yml`
+**Responsibility**: Configure Prometheus to scrape metrics from all system components
 
-```yaml
-global:
-  scrape_interval: 15s
-  evaluation_interval: 15s
+**Configuration File**: `infrastructure/monitoring/prometheus.yml`
 
-scrape_configs:
-  - job_name: 'prometheus'
-    static_configs:
-      - targets: ['localhost:9090']
+**Required Scrape Jobs**:
+- `prometheus`: Self-monitoring (localhost:9090)
+- `airflow`: Airflow metrics (airflow-webserver:8080, path: /admin/metrics/)
+- `spark`: Spark master metrics (spark-master:8080)
+- `postgres`: PostgreSQL exporter (postgres-exporter:9187)
+- `localstack`: LocalStack metrics (localstack:4566)
+- `custom_pipeline_metrics`: Custom application metrics (pipeline-metrics:8000)
 
-  - job_name: 'airflow'
-    static_configs:
-      - targets: ['airflow-webserver:8080']
-    metrics_path: '/admin/metrics/'
+**Global Settings**:
+- Scrape interval: 15 seconds
+- Evaluation interval: 15 seconds
 
-  - job_name: 'spark'
-    static_configs:
-      - targets: ['spark-master:8080']
+**Docker Compose Services** (`docker-compose.yml`):
 
-  - job_name: 'postgres'
-    static_configs:
-      - targets: ['postgres-exporter:9187']
+**Prometheus Service**:
+- Image: `prom/prometheus:latest`
+- Port: 9090
+- Volume: Mount prometheus.yml configuration
+- Volume: Persistent storage for time-series data (prometheus-data)
+- Command: Specify config file and storage path
 
-  - job_name: 'localstack'
-    static_configs:
-      - targets: ['localstack:4566']
+**Grafana Service**:
+- Image: `grafana/grafana:latest`
+- Port: 3000
+- Environment: Admin password (admin), disable sign-up
+- Volumes: Persistent storage (grafana-data), provisioned dashboards and datasources
+- Depends on: Prometheus
 
-  - job_name: 'custom_pipeline_metrics'
-    static_configs:
-      - targets: ['pipeline-metrics:8000']
-```
+**PostgreSQL Exporter Service**:
+- Image: `prometheuscommunity/postgres-exporter:latest`
+- Port: 9187
+- Environment: PostgreSQL connection string (DATA_SOURCE_NAME)
+- Purpose: Export PostgreSQL-specific metrics
 
-**Update docker-compose.yml**:
-```yaml
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: prometheus
-    volumes:
-      - ../../infrastructure/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus-data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-    ports:
-      - "9090:9090"
-    networks:
-      - air-quality-network
-
-  grafana:
-    image: grafana/grafana:latest
-    container_name: grafana
-    depends_on:
-      - prometheus
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_USERS_ALLOW_SIGN_UP=false
-    volumes:
-      - grafana-data:/var/lib/grafana
-      - ../../infrastructure/monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
-      - ../../infrastructure/monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
-    ports:
-      - "3000:3000"
-    networks:
-      - air-quality-network
-
-  postgres-exporter:
-    image: prometheuscommunity/postgres-exporter:latest
-    container_name: postgres-exporter
-    environment:
-      - DATA_SOURCE_NAME=postgresql://airflow:airflow@postgres:5432/air_quality_warehouse?sslmode=disable
-    ports:
-      - "9187:9187"
-    networks:
-      - air-quality-network
-
-volumes:
-  prometheus-data:
-  grafana-data:
-```
+**Volumes**:
+- `prometheus-data`: Persistent time-series database
+- `grafana-data`: Persistent dashboard configurations
 
 ---
 
 ### 7.2 Custom Metrics Exporter
 
-**File**: `src/monitoring/metrics_exporter.py`
+**Module**: `src/monitoring/metrics_exporter.py`
 
-```python
-from prometheus_client import start_http_server, Gauge, Counter, Histogram
-import time
-import psycopg2
+**Responsibility**: Expose custom application metrics in Prometheus format (SRP)
 
-from src.common.config import config
-from src.common.logger import setup_logger
+**Class**: `MetricsExporter`
 
-logger = setup_logger(__name__)
+**Metric Definitions** (using prometheus_client):
 
+1. **pipeline_records_processed** (Counter):
+   - Name: `pipeline_records_processed_total`
+   - Description: Total records processed by pipeline
+   - Labels: `layer` (bronze/silver/gold), `status` (success/failure)
+   - Purpose: Track volume of processed data
 
-pipeline_records_processed = Counter(
-    'pipeline_records_processed_total',
-    'Total records processed by pipeline',
-    ['layer', 'status']
-)
+2. **pipeline_execution_duration** (Histogram):
+   - Name: `pipeline_execution_duration_seconds`
+   - Description: Pipeline execution duration
+   - Labels: `pipeline_name`
+   - Purpose: Monitor pipeline performance, identify slowdowns
 
-pipeline_execution_duration = Histogram(
-    'pipeline_execution_duration_seconds',
-    'Pipeline execution duration',
-    ['pipeline_name']
-)
+3. **data_quality_score** (Gauge):
+   - Name: `data_quality_score`
+   - Description: Current data quality score
+   - Labels: `layer`
+   - Purpose: Track quality degradation in real-time
 
-data_quality_score = Gauge(
-    'data_quality_score',
-    'Current data quality score',
-    ['layer']
-)
+4. **pipeline_lag_seconds** (Gauge):
+   - Name: `pipeline_lag_seconds`
+   - Description: Time lag between source and warehouse
+   - Labels: `layer`
+   - Purpose: Detect processing delays
 
-pipeline_lag_seconds = Gauge(
-    'pipeline_lag_seconds',
-    'Time lag between source and warehouse',
-    ['layer']
-)
+5. **active_streaming_consumers** (Gauge):
+   - Name: `active_streaming_consumers`
+   - Description: Number of active streaming consumers
+   - Purpose: Monitor streaming pipeline health
 
-active_streaming_consumers = Gauge(
-    'active_streaming_consumers',
-    'Number of active streaming consumers'
-)
+**Key Methods**:
 
+- `__init__()`: Establish PostgreSQL connection to query metrics
+- `collect_quality_metrics()`: Query avg quality score by layer (last 24h), update gauge
+- `collect_pipeline_lag()`: Calculate time difference between now and latest measurement, update gauge
+- `collect_record_counts()`: Count today's processed records, increment counter
+- `run(port=8000)`: Start HTTP server, continuously collect metrics every 60 seconds
 
-class MetricsExporter:
-    
-    def __init__(self):
-        self.conn = psycopg2.connect(
-            host=config.database.host,
-            port=config.database.port,
-            database=config.database.database,
-            user=config.database.user,
-            password=config.database.password
-        )
-    
-    def collect_quality_metrics(self):
-        with self.conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    layer,
-                    AVG(success_rate) as avg_score
-                FROM data_quality_metrics
-                WHERE execution_timestamp >= NOW() - INTERVAL '1 day'
-                GROUP BY layer
-            """)
-            
-            for layer, score in cur.fetchall():
-                data_quality_score.labels(layer=layer).set(score)
-    
-    def collect_pipeline_lag(self):
-        with self.conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    EXTRACT(EPOCH FROM (NOW() - MAX(measurement_timestamp))) as lag_seconds
-                FROM facts.fact_air_quality_measurements
-            """)
-            
-            result = cur.fetchone()
-            if result and result[0]:
-                pipeline_lag_seconds.labels(layer='gold').set(result[0])
-    
-    def collect_record_counts(self):
-        with self.conn.cursor() as cur:
-            cur.execute("""
-                SELECT COUNT(*) FROM facts.fact_air_quality_measurements
-                WHERE DATE(measurement_timestamp) = CURRENT_DATE
-            """)
-            
-            count = cur.fetchone()[0]
-            pipeline_records_processed.labels(layer='gold', status='success').inc(count)
-    
-    def run(self, port: int = 8000):
-        start_http_server(port)
-        logger.info(f"Metrics server started on port {port}")
-        
-        while True:
-            try:
-                self.collect_quality_metrics()
-                self.collect_pipeline_lag()
-                self.collect_record_counts()
-                logger.debug("Metrics collected")
-            except Exception as e:
-                logger.error(f"Error collecting metrics: {e}")
-            
-            time.sleep(60)
+**SQL Queries Required**:
+- Quality metrics: `SELECT layer, AVG(success_rate) FROM data_quality_metrics WHERE execution_timestamp >= NOW() - INTERVAL '1 day' GROUP BY layer`
+- Pipeline lag: `SELECT EXTRACT(EPOCH FROM (NOW() - MAX(measurement_timestamp))) FROM facts.fact_air_quality_measurements`
+- Record counts: `SELECT COUNT(*) FROM facts.fact_air_quality_measurements WHERE DATE(measurement_timestamp) = CURRENT_DATE`
 
-
-def main():
-    exporter = MetricsExporter()
-    exporter.run()
-
-
-if __name__ == "__main__":
-    main()
-```
+**Error Handling**: Log errors, continue collection loop (resilience)
 
 ---
 
@@ -226,174 +143,87 @@ if __name__ == "__main__":
 
 **File**: `infrastructure/monitoring/grafana/datasources/prometheus.yml`
 
-```yaml
-apiVersion: 1
+**Responsibility**: Provision datasources automatically when Grafana starts
 
-datasources:
-  - name: Prometheus
-    type: prometheus
-    access: proxy
-    url: http://prometheus:9090
-    isDefault: true
-    editable: true
+**Datasources Required**:
 
-  - name: PostgreSQL
-    type: postgres
-    url: postgres:5432
-    database: air_quality_warehouse
-    user: airflow
-    secureJsonData:
-      password: airflow
-    jsonData:
-      sslmode: disable
-      postgresVersion: 1500
-```
+1. **Prometheus Datasource**:
+   - Name: Prometheus
+   - Type: prometheus
+   - Access mode: proxy (server-side requests)
+   - URL: http://prometheus:9090
+   - Default: true
+   - Editable: true
+
+2. **PostgreSQL Datasource**:
+   - Name: PostgreSQL
+   - Type: postgres
+   - URL: postgres:5432
+   - Database: air_quality_warehouse
+   - User: airflow
+   - Password: airflow (secureJsonData)
+   - SSL mode: disable
+   - PostgreSQL version: 15.0 (1500)
+
+**Purpose**: Enable direct SQL queries for complex analytics and quality metrics visualization
 
 ---
 
 ### 7.4 Grafana Dashboards
 
-**File**: `infrastructure/monitoring/grafana/dashboards/pipeline_overview.json`
+**Responsibility**: Visualize pipeline health, data quality, and system performance
 
-```json
-{
-  "dashboard": {
-    "title": "Air Quality Pipeline Overview",
-    "tags": ["pipeline", "overview"],
-    "timezone": "browser",
-    "panels": [
-      {
-        "id": 1,
-        "title": "Records Processed (24h)",
-        "type": "stat",
-        "targets": [
-          {
-            "expr": "sum(increase(pipeline_records_processed_total[24h]))",
-            "legendFormat": "Total Records"
-          }
-        ],
-        "gridPos": {
-          "h": 4,
-          "w": 6,
-          "x": 0,
-          "y": 0
-        }
-      },
-      {
-        "id": 2,
-        "title": "Data Quality Score",
-        "type": "gauge",
-        "targets": [
-          {
-            "expr": "avg(data_quality_score)",
-            "legendFormat": "Quality Score"
-          }
-        ],
-        "gridPos": {
-          "h": 4,
-          "w": 6,
-          "x": 6,
-          "y": 0
-        },
-        "fieldConfig": {
-          "defaults": {
-            "thresholds": {
-              "mode": "absolute",
-              "steps": [
-                {"value": 0, "color": "red"},
-                {"value": 80, "color": "yellow"},
-                {"value": 95, "color": "green"}
-              ]
-            },
-            "min": 0,
-            "max": 100
-          }
-        }
-      },
-      {
-        "id": 3,
-        "title": "Pipeline Lag",
-        "type": "graph",
-        "targets": [
-          {
-            "expr": "pipeline_lag_seconds",
-            "legendFormat": "{{layer}}"
-          }
-        ],
-        "gridPos": {
-          "h": 8,
-          "w": 12,
-          "x": 0,
-          "y": 4
-        }
-      },
-      {
-        "id": 4,
-        "title": "Pipeline Execution Duration",
-        "type": "graph",
-        "targets": [
-          {
-            "expr": "histogram_quantile(0.95, pipeline_execution_duration_seconds_bucket)",
-            "legendFormat": "p95 - {{pipeline_name}}"
-          }
-        ],
-        "gridPos": {
-          "h": 8,
-          "w": 12,
-          "x": 12,
-          "y": 4
-        }
-      }
-    ]
-  }
-}
-```
+**Dashboard 1: Pipeline Overview** (`pipeline_overview.json`)
 
-**File**: `infrastructure/monitoring/grafana/dashboards/data_quality.json`
+**Title**: Air Quality Pipeline Overview  
+**Tags**: pipeline, overview
 
-```json
-{
-  "dashboard": {
-    "title": "Data Quality Monitoring",
-    "tags": ["data-quality"],
-    "panels": [
-      {
-        "id": 1,
-        "title": "Quality Score by Layer",
-        "type": "graph",
-        "targets": [
-          {
-            "expr": "data_quality_score",
-            "legendFormat": "{{layer}}"
-          }
-        ],
-        "gridPos": {
-          "h": 8,
-          "w": 12,
-          "x": 0,
-          "y": 0
-        }
-      },
-      {
-        "id": 2,
-        "title": "Failed Expectations (7 days)",
-        "type": "table",
-        "targets": [
-          {
-            "rawSql": "SELECT layer, suite_name, failed_expectations, execution_timestamp FROM data_quality_metrics WHERE execution_timestamp >= NOW() - INTERVAL '7 days' AND failed_expectations > 0 ORDER BY execution_timestamp DESC LIMIT 20"
-          }
-        ],
-        "gridPos": {
-          "h": 8,
-          "w": 12,
-          "x": 12,
-          "y": 0
-        }
-      }
-    ]
-  }
-}
-```
+**Panels**:
+
+1. **Records Processed (24h)** - Stat Panel:
+   - Query: `sum(increase(pipeline_records_processed_total[24h]))`
+   - Position: Top-left (0,0), size 6x4
+   - Purpose: Show total volume processed in last 24 hours
+
+2. **Data Quality Score** - Gauge Panel:
+   - Query: `avg(data_quality_score)`
+   - Position: Top-center (6,0), size 6x4
+   - Thresholds: Red (0-80), Yellow (80-95), Green (95-100)
+   - Purpose: Visual indicator of overall quality health
+
+3. **Pipeline Lag** - Graph Panel:
+   - Query: `pipeline_lag_seconds` (grouped by layer)
+   - Position: Middle-left (0,4), size 12x8
+   - Purpose: Track processing delays over time
+
+4. **Pipeline Execution Duration (p95)** - Graph Panel:
+   - Query: `histogram_quantile(0.95, pipeline_execution_duration_seconds_bucket)`
+   - Position: Middle-right (12,4), size 12x8
+   - Purpose: Identify performance degradation
+
+**Dashboard 2: Data Quality Monitoring** (`data_quality.json`)
+
+**Title**: Data Quality Monitoring  
+**Tags**: data-quality
+
+**Panels**:
+
+1. **Quality Score by Layer** - Graph Panel:
+   - Query: `data_quality_score` (all layers)
+   - Position: Left (0,0), size 12x8
+   - Purpose: Compare quality across Bronze/Silver/Gold layers
+
+2. **Failed Expectations (7 days)** - Table Panel:
+   - Datasource: PostgreSQL
+   - Query: Select layer, suite_name, failed_expectations, execution_timestamp from data_quality_metrics WHERE failed_expectations > 0 (last 7 days, limit 20)
+   - Position: Right (12,0), size 12x8
+   - Purpose: Drill-down into specific quality failures
+
+**JSON Structure Requirements**:
+- Use Grafana dashboard schema version (apiVersion: 1)
+- Include gridPos for all panels (x, y, w, h)
+- Specify panel types: stat, gauge, graph, table
+- Define targets with PromQL expressions or SQL queries
 
 ---
 
@@ -401,175 +231,115 @@ datasources:
 
 **File**: `infrastructure/monitoring/alert_rules.yml`
 
-```yaml
-groups:
-  - name: pipeline_alerts
-    interval: 1m
-    rules:
-      - alert: PipelineLagHigh
-        expr: pipeline_lag_seconds > 3600
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Pipeline lag is high"
-          description: "Pipeline is {{ $value }} seconds behind"
+**Responsibility**: Define alert conditions for critical pipeline failures
 
-      - alert: DataQualityLow
-        expr: data_quality_score < 90
-        for: 10m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Data quality score below threshold"
-          description: "Quality score is {{ $value }}% for {{ $labels.layer }}"
+**Alert Group**: pipeline_alerts  
+**Evaluation Interval**: 1 minute
 
-      - alert: PipelineExecutionFailed
-        expr: increase(airflow_task_failed_total[5m]) > 0
-        labels:
-          severity: critical
-        annotations:
-          summary: "Pipeline execution failed"
-          description: "Task {{ $labels.task_id }} failed in DAG {{ $labels.dag_id }}"
+**Alert Rules**:
 
-      - alert: NoRecentData
-        expr: time() - pipeline_lag_seconds > 7200
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "No recent data ingested"
-          description: "No data ingested in the last 2 hours"
-```
+1. **PipelineLagHigh**:
+   - Condition: `pipeline_lag_seconds > 3600`
+   - Duration: 5 minutes
+   - Severity: warning
+   - Purpose: Detect when pipeline is >1 hour behind
+
+2. **DataQualityLow**:
+   - Condition: `data_quality_score < 90`
+   - Duration: 10 minutes
+   - Severity: critical
+   - Purpose: Alert when quality drops below acceptable threshold (90%)
+
+3. **PipelineExecutionFailed**:
+   - Condition: `increase(airflow_task_failed_total[5m]) > 0`
+   - Duration: immediate
+   - Severity: critical
+   - Purpose: Immediate notification of Airflow task failures
+
+4. **NoRecentData**:
+   - Condition: `time() - pipeline_lag_seconds > 7200`
+   - Duration: 5 minutes
+   - Severity: critical
+   - Purpose: Alert when no data ingested in last 2 hours
+
+**Annotation Template Variables**:
+- `{{ $value }}`: Metric value triggering alert
+- `{{ $labels.layer }}`: Layer label from metric
+- `{{ $labels.task_id }}`, `{{ $labels.dag_id }}`: Airflow task context
 
 ---
 
 ### 7.6 Health Check Endpoint
 
-**File**: `src/monitoring/health_check.py`
+**Module**: `src/monitoring/health_check.py`
 
-```python
-from flask import Flask, jsonify
-import psycopg2
-from datetime import datetime, timedelta
+**Responsibility**: Provide HTTP endpoints for liveness and readiness probes (Kubernetes-compatible)
 
-from src.common.config import config
-from src.common.logger import setup_logger
+**Framework**: Flask
 
-app = Flask(__name__)
-logger = setup_logger(__name__)
+**Endpoints**:
 
+1. **GET /health** (Health Check):
+   - Purpose: Overall system health status
+   - Response codes: 200 (healthy), 503 (unhealthy)
+   - Checks performed:
+     - Database connection (`check_database_connection()`)
+     - Data freshness (`check_data_freshness()`)
+   
+   **Response Schema**:
+   ```json
+   {
+     "status": "healthy|unhealthy",
+     "checks": {
+       "database": true|false,
+       "data_freshness": true|false
+     },
+     "timestamp": "ISO-8601 timestamp"
+   }
+   ```
 
-def check_database_connection():
-    try:
-        conn = psycopg2.connect(
-            host=config.database.host,
-            port=config.database.port,
-            database=config.database.database,
-            user=config.database.user,
-            password=config.database.password
-        )
-        conn.close()
-        return True
-    except:
-        return False
+2. **GET /metrics** (Summary Metrics):
+   - Purpose: Quick metrics snapshot without Prometheus
+   - Response code: 200 (success), 500 (error)
+   
+   **Response Schema**:
+   ```json
+   {
+     "total_measurements": int,
+     "avg_quality_score": float
+   }
+   ```
 
+**Check Functions**:
 
-def check_data_freshness():
-    try:
-        conn = psycopg2.connect(
-            host=config.database.host,
-            port=config.database.port,
-            database=config.database.database,
-            user=config.database.user,
-            password=config.database.password
-        )
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT MAX(measurement_timestamp)
-                FROM facts.fact_air_quality_measurements
-            """)
-            latest = cur.fetchone()[0]
-            conn.close()
-            
-            if latest:
-                age = datetime.utcnow() - latest
-                return age < timedelta(hours=2)
-        return False
-    except:
-        return False
+- `check_database_connection()`: Attempt PostgreSQL connection, return boolean
+- `check_data_freshness()`: Query max measurement_timestamp, verify <2 hours old
 
+**SQL Queries**:
+- Freshness check: `SELECT MAX(measurement_timestamp) FROM facts.fact_air_quality_measurements`
+- Metrics summary: Join total measurements count with avg quality score (last 24h)
 
-@app.route('/health')
-def health():
-    db_ok = check_database_connection()
-    data_fresh = check_data_freshness()
-    
-    status = "healthy" if (db_ok and data_fresh) else "unhealthy"
-    
-    return jsonify({
-        "status": status,
-        "checks": {
-            "database": db_ok,
-            "data_freshness": data_fresh
-        },
-        "timestamp": datetime.utcnow().isoformat()
-    }), 200 if status == "healthy" else 503
-
-
-@app.route('/metrics')
-def metrics():
-    try:
-        conn = psycopg2.connect(
-            host=config.database.host,
-            port=config.database.port,
-            database=config.database.database,
-            user=config.database.user,
-            password=config.database.password
-        )
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    (SELECT COUNT(*) FROM facts.fact_air_quality_measurements) as total_measurements,
-                    (SELECT AVG(success_rate) FROM data_quality_metrics WHERE execution_timestamp >= NOW() - INTERVAL '1 day') as avg_quality_score
-            """)
-            
-            result = cur.fetchone()
-            conn.close()
-            
-            return jsonify({
-                "total_measurements": result[0],
-                "avg_quality_score": float(result[1]) if result[1] else 0
-            })
-    except Exception as e:
-        logger.error(f"Error fetching metrics: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-def main():
-    app.run(host='0.0.0.0', port=8000)
-
-
-if __name__ == "__main__":
-    main()
-```
+**Server Configuration**: Listen on 0.0.0.0:8000 for external access
 
 ---
 
-### 7.7 Makefile Updates
+### 7.7 Makefile Automation
 
-```makefile
-.PHONY: monitoring-up monitoring-down metrics-exporter
+**File**: `Makefile`
 
-monitoring-up:
-	docker-compose -f infrastructure/docker/docker-compose.yml up -d prometheus grafana postgres-exporter
+**Targets to Add**:
 
-monitoring-down:
-	docker-compose -f infrastructure/docker/docker-compose.yml stop prometheus grafana postgres-exporter
+- `monitoring-up`: Start monitoring stack (Prometheus, Grafana, PostgreSQL exporter)
+  - Command: `docker-compose -f infrastructure/docker/docker-compose.yml up -d prometheus grafana postgres-exporter`
+  
+- `monitoring-down`: Stop monitoring services
+  - Command: `docker-compose -f infrastructure/docker/docker-compose.yml stop prometheus grafana postgres-exporter`
+  
+- `metrics-exporter`: Run custom metrics exporter in foreground
+  - Command: `poetry run python -m src.monitoring.metrics_exporter`
 
-metrics-exporter:
-	poetry run python -m src.monitoring.metrics_exporter
-```
+- `health-check`: Run health check server
+  - Command: `poetry run python -m src.monitoring.health_check`
 
 ---
 

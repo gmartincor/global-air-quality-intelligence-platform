@@ -15,268 +15,167 @@
 
 ---
 
+## Architecture & Design Principles
+
+**Testing Pyramid**: 70% unit tests, 20% integration tests, 10% E2E tests
+
+**Test Strategy**:
+- Unit: Test individual functions in isolation (mocks/stubs)
+- Integration: Test component interactions (real services)
+- E2E: Test complete user workflows (full stack)
+
+**Quality Gates**:
+- Code formatting: Black, isort
+- Linting: Flake8
+- Type checking: mypy
+- Security: Trivy image scanning
+- Coverage threshold: 80%
+
+**SOLID Application in Tests**:
+- **SRP**: Each test class tests one component
+- **DIP**: Use fixtures for dependencies, not hardcoded instances
+- **OCP**: Parameterized tests extend coverage without modifying test logic
+
+**DRY in Tests**: Reusable fixtures, shared test utilities, parameterized test cases
+
+---
+
 ## Tasks Breakdown
 
 ### 8.1 Unit Tests
 
-**File**: `tests/unit/processing/test_aqi_calculator.py`
+**Test Module**: `tests/unit/processing/test_aqi_calculator.py`
 
-```python
-import pytest
-from src.processing.spark.transformations.enrichment import calculate_aqi_pm25
+**Class**: `TestAQICalculator`
 
+**Responsibility**: Verify AQI calculation logic for PM2.5 values across all EPA ranges
 
-class TestAQICalculator:
-    
-    def test_good_range(self):
-        assert calculate_aqi_pm25(10.5) == 44
-    
-    def test_moderate_range(self):
-        assert calculate_aqi_pm25(25.0) == 79
-    
-    def test_unhealthy_range(self):
-        assert calculate_aqi_pm25(45.0) == 112
-    
-    def test_very_unhealthy_range(self):
-        assert calculate_aqi_pm25(200.0) == 250
-    
-    def test_hazardous_range(self):
-        assert calculate_aqi_pm25(350.5) == 458
-    
-    def test_boundary_low(self):
-        assert calculate_aqi_pm25(0.0) == 0
-    
-    def test_boundary_high(self):
-        assert calculate_aqi_pm25(500.0) == 500
-    
-    @pytest.mark.parametrize("pm25,expected", [
-        (12.0, 50),
-        (35.4, 100),
-        (55.4, 150),
-        (150.4, 200),
-        (250.4, 300),
-    ])
-    def test_boundary_values(self, pm25, expected):
-        result = calculate_aqi_pm25(pm25)
-        assert abs(result - expected) <= 1
-```
+**Test Cases Required**:
+- `test_good_range`: PM2.5 = 10.5 → AQI ≈ 44
+- `test_moderate_range`: PM2.5 = 25.0 → AQI ≈ 79
+- `test_unhealthy_range`: PM2.5 = 45.0 → AQI ≈ 112
+- `test_very_unhealthy_range`: PM2.5 = 200.0 → AQI ≈ 250
+- `test_hazardous_range`: PM2.5 = 350.5 → AQI ≈ 458
+- `test_boundary_low`: PM2.5 = 0.0 → AQI = 0
+- `test_boundary_high`: PM2.5 = 500.0 → AQI = 500
 
-**File**: `tests/unit/data_generation/test_temporal_patterns.py`
+**Parameterized Test**: `test_boundary_values`
+- Test EPA breakpoint boundaries: (12.0→50), (35.4→100), (55.4→150), (150.4→200), (250.4→300)
+- Assert calculated AQI within ±1 of expected (allows rounding tolerance)
 
-```python
-import pytest
-from src.data_generation.generators.temporal_patterns import TemporalPatternGenerator
+**Import**: `from src.processing.spark.transformations.enrichment import calculate_aqi_pm25`
 
+---
 
-class TestTemporalPatterns:
-    
-    def test_rush_hour_multiplier(self):
-        gen = TemporalPatternGenerator()
-        assert gen.get_hour_of_day_multiplier(8) == 1.4
-        assert gen.get_hour_of_day_multiplier(18) == 1.4
-    
-    def test_night_multiplier(self):
-        gen = TemporalPatternGenerator()
-        assert gen.get_hour_of_day_multiplier(2) == 0.6
-        assert gen.get_hour_of_day_multiplier(23) == 0.6
-    
-    def test_weekend_multiplier(self):
-        gen = TemporalPatternGenerator()
-        assert gen.get_day_of_week_multiplier(5) == 0.8
-        assert gen.get_day_of_week_multiplier(6) == 0.8
-    
-    def test_weekday_multiplier(self):
-        gen = TemporalPatternGenerator()
-        assert gen.get_day_of_week_multiplier(0) == 1.0
-        assert gen.get_day_of_week_multiplier(4) == 1.0
-    
-    def test_sensor_noise_positive(self):
-        gen = TemporalPatternGenerator()
-        value = 100.0
-        noisy = gen.add_sensor_noise(value)
-        assert noisy >= 0
-        assert 70 <= noisy <= 130
-```
+**Test Module**: `tests/unit/data_generation/test_temporal_patterns.py`
 
-**File**: `tests/unit/common/test_config.py`
+**Class**: `TestTemporalPatterns`
 
-```python
-import pytest
-from pathlib import Path
-from src.common.config import AppConfig
+**Responsibility**: Verify temporal pattern multipliers for realistic data generation
 
+**Test Cases Required**:
+- `test_rush_hour_multiplier`: Hours 8 and 18 → multiplier = 1.4 (increased pollution)
+- `test_night_multiplier`: Hours 2 and 23 → multiplier = 0.6 (reduced activity)
+- `test_weekend_multiplier`: Days 5 and 6 (Sat/Sun) → multiplier = 0.8
+- `test_weekday_multiplier`: Days 0-4 (Mon-Fri) → multiplier = 1.0
+- `test_sensor_noise_positive`: Noise adds variability within ±30% range, value ≥ 0
 
-class TestConfig:
-    
-    def test_default_config(self):
-        config = AppConfig()
-        assert config.environment == "dev"
-        assert config.s3.bronze_bucket == "dev-air-quality-bronze"
-    
-    def test_s3_config(self):
-        config = AppConfig()
-        assert config.s3.endpoint_url == "http://localhost:4566"
-        assert config.s3.region == "us-east-1"
-    
-    def test_kinesis_config(self):
-        config = AppConfig()
-        assert config.kinesis.stream_name == "air-quality-measurements"
-    
-    def test_database_config(self):
-        config = AppConfig()
-        assert config.database.host == "localhost"
-        assert config.database.port == 5432
-```
+**Import**: `from src.data_generation.generators.temporal_patterns import TemporalPatternGenerator`
+
+---
+
+**Test Module**: `tests/unit/common/test_config.py`
+
+**Class**: `TestConfig`
+
+**Responsibility**: Validate configuration loading and default values
+
+**Test Cases Required**:
+- `test_default_config`: environment = "dev", bronze_bucket = "dev-air-quality-bronze"
+- `test_s3_config`: endpoint_url = "http://localhost:4566", region = "us-east-1"
+- `test_kinesis_config`: stream_name = "air-quality-measurements"
+- `test_database_config`: host = "localhost", port = 5432
+
+**Import**: `from src.common.config import AppConfig`
 
 ---
 
 ### 8.2 Integration Tests
 
-**File**: `tests/integration/test_s3_operations.py`
+**Test Module**: `tests/integration/test_s3_operations.py`
 
-```python
-import pytest
-import pandas as pd
-from src.ingestion.batch.s3_uploader import S3Uploader
-from src.common.aws_client import AWSClientFactory
+**Class**: `TestS3Operations`
 
+**Responsibility**: Test S3 upload/download operations with LocalStack
 
-@pytest.fixture
-def sample_dataframe():
-    return pd.DataFrame({
-        "city_id": ["NYC001", "LON001"],
-        "timestamp": ["2024-01-01 12:00:00", "2024-01-01 12:00:00"],
-        "pm25_value": [25.5, 30.2]
-    })
+**Fixture**: `sample_dataframe` (pandas DataFrame with city_id, timestamp, pm25_value)
 
+**Test Case**: `test_upload_and_verify`
+- Upload DataFrame using `S3Uploader.upload_parquet_partitioned()`
+- List objects in S3 bucket using `AWSClientFactory.create_s3_client()`
+- Assert "Contents" key exists and contains uploaded files
 
-class TestS3Operations:
-    
-    def test_upload_and_verify(self, sample_dataframe):
-        uploader = S3Uploader()
-        uploader.upload_parquet_partitioned(sample_dataframe, "test-data")
-        
-        s3_client = AWSClientFactory.create_s3_client()
-        response = s3_client.list_objects_v2(
-            Bucket="dev-air-quality-bronze",
-            Prefix="test-data/"
-        )
-        
-        assert "Contents" in response
-        assert len(response["Contents"]) > 0
-```
+**Dependencies**: LocalStack S3 service running
 
-**File**: `tests/integration/test_spark_job.py`
+---
 
-```python
-import pytest
-from pyspark.sql import SparkSession
-from src.processing.spark.transformations.cleansing import remove_nulls, deduplicate
+**Test Module**: `tests/integration/test_spark_job.py`
 
+**Class**: `TestSparkTransformations`
 
-@pytest.fixture(scope="module")
-def spark():
-    spark = SparkSession.builder \
-        .appName("test") \
-        .master("local[2]") \
-        .getOrCreate()
-    yield spark
-    spark.stop()
+**Responsibility**: Test Spark transformations with real SparkSession
 
+**Fixture**: `spark` (module-scoped SparkSession, local[2] mode)
 
-class TestSparkTransformations:
-    
-    def test_remove_nulls(self, spark):
-        data = [
-            ("NYC001", "2024-01-01", 25.5),
-            ("LON001", None, 30.2),
-            (None, "2024-01-01", 35.1)
-        ]
-        df = spark.createDataFrame(data, ["city_id", "timestamp", "pm25_value"])
-        
-        result = remove_nulls(df, ["city_id", "timestamp"])
-        
-        assert result.count() == 1
-        assert result.first()["city_id"] == "NYC001"
-    
-    def test_deduplicate(self, spark):
-        data = [
-            ("NYC001", "2024-01-01 12:00:00", 25.5),
-            ("NYC001", "2024-01-01 12:00:00", 26.0),
-            ("LON001", "2024-01-01 12:00:00", 30.2)
-        ]
-        df = spark.createDataFrame(data, ["city_id", "timestamp", "pm25_value"])
-        
-        result = deduplicate(df, ["city_id", "timestamp"])
-        
-        assert result.count() == 2
-```
+**Test Cases Required**:
+
+1. `test_remove_nulls`:
+   - Input: 3 rows, 2 with nulls in city_id or timestamp
+   - Apply: `remove_nulls(df, ["city_id", "timestamp"])`
+   - Assert: 1 row remains (NYC001 row)
+
+2. `test_deduplicate`:
+   - Input: 3 rows, 2 duplicates (same city_id + timestamp)
+   - Apply: `deduplicate(df, ["city_id", "timestamp"])`
+   - Assert: 2 unique rows remain
+
+**Imports**: `from src.processing.spark.transformations.cleansing import remove_nulls, deduplicate`
 
 ---
 
 ### 8.3 End-to-End Tests
 
-**File**: `tests/e2e/test_batch_pipeline.py`
+**Test Module**: `tests/e2e/test_batch_pipeline.py`
 
-```python
-import pytest
-import time
-from pathlib import Path
-import pandas as pd
-from src.data_generation.batch_generator import BatchDataGenerator
-from src.ingestion.batch.s3_uploader import S3Uploader
+**Class**: `TestBatchPipeline`
 
+**Responsibility**: Validate complete batch pipeline flow (generation → upload → S3)
 
-class TestBatchPipeline:
-    
-    def test_full_pipeline_flow(self):
-        generator = BatchDataGenerator(mode="sample")
-        df = generator.generate()
-        
-        assert len(df) > 0
-        assert "city_id" in df.columns
-        assert "pm25_value" in df.columns
-        
-        uploader = S3Uploader()
-        uploader.upload_parquet_partitioned(df, "e2e-test")
-        
-        time.sleep(5)
-```
+**Test Case**: `test_full_pipeline_flow`
+- Generate sample data: `BatchDataGenerator(mode="sample").generate()`
+- Assert DataFrame has rows and required columns (city_id, pm25_value)
+- Upload to S3: `S3Uploader().upload_parquet_partitioned()`
+- Wait 5 seconds for async completion
+- Optionally verify S3 object exists
 
-**File**: `tests/e2e/test_streaming_pipeline.py`
+**Dependencies**: LocalStack S3, data generation module
 
-```python
-import pytest
-import time
-from src.ingestion.streaming.kinesis_producer import KinesisProducer
-from src.processing.streaming.dynamodb_writer import DynamoDBSpeedLayerWriter
+---
 
+**Test Module**: `tests/e2e/test_streaming_pipeline.py`
 
-class TestStreamingPipeline:
-    
-    def test_kinesis_to_dynamodb(self):
-        producer = KinesisProducer()
-        
-        test_record = {
-            "city_id": "TEST001",
-            "city_name": "Test City",
-            "timestamp": "2024-01-01T12:00:00",
-            "pm25_value": 25.5,
-            "pm10_value": 35.0,
-            "aqi_value": 80,
-            "aqi_category": "Moderate",
-            "temperature_c": 20.0
-        }
-        
-        producer.put_record(test_record)
-        
-        time.sleep(5)
-        
-        writer = DynamoDBSpeedLayerWriter()
-        results = writer.get_latest_measurements("TEST001", limit=1)
-        
-        assert len(results) > 0
-```
+**Class**: `TestStreamingPipeline`
+
+**Responsibility**: Validate streaming pipeline (Kinesis → DynamoDB)
+
+**Test Case**: `test_kinesis_to_dynamodb`
+- Create test record (city_id="TEST001", pm25_value=25.5, etc.)
+- Publish to Kinesis: `KinesisProducer().put_record()`
+- Wait 5 seconds for consumer processing
+- Query DynamoDB: `DynamoDBSpeedLayerWriter().get_latest_measurements()`
+- Assert at least 1 result returned
+
+**Dependencies**: LocalStack Kinesis, DynamoDB, streaming consumer running
 
 ---
 
@@ -284,46 +183,33 @@ class TestStreamingPipeline:
 
 **File**: `.pre-commit-config.yaml`
 
-```yaml
-repos:
-  - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.5.0
-    hooks:
-      - id: trailing-whitespace
-      - id: end-of-file-fixer
-      - id: check-yaml
-      - id: check-added-large-files
-        args: ['--maxkb=10000']
-      - id: check-json
-      - id: check-toml
-      - id: detect-private-key
+**Responsibility**: Enforce code quality standards before commits
 
-  - repo: https://github.com/psf/black
-    rev: 23.11.0
-    hooks:
-      - id: black
-        language_version: python3.10
-        args: ['--line-length=100']
+**Hooks Required**:
 
-  - repo: https://github.com/pycqa/isort
-    rev: 5.12.0
-    hooks:
-      - id: isort
-        args: ['--profile', 'black', '--line-length=100']
+1. **Pre-commit built-in hooks** (v4.5.0):
+   - `trailing-whitespace`: Remove trailing spaces
+   - `end-of-file-fixer`: Ensure newline at EOF
+   - `check-yaml`: Validate YAML syntax
+   - `check-json`: Validate JSON syntax
+   - `check-toml`: Validate TOML syntax
+   - `check-added-large-files`: Reject files >10MB
+   - `detect-private-key`: Prevent credential leaks
 
-  - repo: https://github.com/pycqa/flake8
-    rev: 6.1.0
-    hooks:
-      - id: flake8
-        args: ['--max-line-length=100', '--extend-ignore=E203,W503']
+2. **Black** (23.11.0):
+   - Language: Python 3.10
+   - Args: `--line-length=100`
 
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.7.0
-    hooks:
-      - id: mypy
-        additional_dependencies: [types-all]
-        args: ['--ignore-missing-imports', '--strict']
-```
+3. **isort** (5.12.0):
+   - Profile: black (compatibility)
+   - Args: `--line-length=100`
+
+4. **Flake8** (6.1.0):
+   - Args: `--max-line-length=100`, `--extend-ignore=E203,W503`
+
+5. **mypy** (v1.7.0):
+   - Dependencies: types-all
+   - Args: `--ignore-missing-imports`, `--strict`
 
 ---
 
@@ -331,135 +217,63 @@ repos:
 
 **File**: `.github/workflows/ci.yml`
 
-```yaml
-name: CI Pipeline
+**Workflow Name**: CI Pipeline
 
-on:
-  push:
-    branches: [ main, develop ]
-  pull_request:
-    branches: [ main, develop ]
+**Triggers**:
+- Push to: main, develop branches
+- Pull requests to: main, develop
 
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    
-    services:
-      postgres:
-        image: postgres:15
-        env:
-          POSTGRES_USER: airflow
-          POSTGRES_PASSWORD: airflow
-          POSTGRES_DB: air_quality_warehouse
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-      
-      localstack:
-        image: localstack/localstack:3.0
-        env:
-          SERVICES: s3,kinesis,dynamodb
-        ports:
-          - 4566:4566
+**Job 1: test** (ubuntu-latest)
 
-    steps:
-      - uses: actions/checkout@v3
-      
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-      
-      - name: Install Poetry
-        run: |
-          curl -sSL https://install.python-poetry.org | python3 -
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-      
-      - name: Install dependencies
-        run: |
-          poetry install
-      
-      - name: Run linting
-        run: |
-          poetry run black --check src/ tests/
-          poetry run isort --check-only src/ tests/
-          poetry run flake8 src/ tests/
-      
-      - name: Run type checking
-        run: |
-          poetry run mypy src/
-      
-      - name: Run unit tests
-        run: |
-          poetry run pytest tests/unit/ -v --cov=src --cov-report=xml
-      
-      - name: Run integration tests
-        run: |
-          poetry run pytest tests/integration/ -v
-      
-      - name: Upload coverage
-        uses: codecov/codecov-action@v3
-        with:
-          file: ./coverage.xml
+**Services Required**:
 
-  build:
-    needs: test
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-    
-    steps:
-      - uses: actions/checkout@v3
-      
-      - name: Build Docker images
-        run: |
-          docker build -f infrastructure/docker/airflow.Dockerfile -t air-quality-airflow:latest .
-      
-      - name: Run security scan
-        run: |
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy image air-quality-airflow:latest
-```
+1. **PostgreSQL**:
+   - Image: postgres:15
+   - Environment: POSTGRES_USER=airflow, POSTGRES_PASSWORD=airflow, POSTGRES_DB=air_quality_warehouse
+   - Port: 5432
+   - Health check: pg_isready every 10s
+
+2. **LocalStack**:
+   - Image: localstack/localstack:3.0
+   - Services: s3, kinesis, dynamodb
+   - Port: 4566
+
+**Steps**:
+1. Checkout code (actions/checkout@v3)
+2. Setup Python 3.10 (actions/setup-python@v4)
+3. Install Poetry (curl installer, add to PATH)
+4. Install dependencies (`poetry install`)
+5. Run linting (black --check, isort --check-only, flake8)
+6. Run type checking (mypy src/)
+7. Run unit tests (pytest tests/unit/ with coverage)
+8. Run integration tests (pytest tests/integration/)
+9. Upload coverage to Codecov (codecov/codecov-action@v3)
+
+**Job 2: build** (needs: test, only on main branch)
+
+**Steps**:
+1. Checkout code
+2. Build Docker images (airflow.Dockerfile)
+3. Run security scan (Trivy on built image)
+
+---
 
 **File**: `.github/workflows/data-quality.yml`
 
-```yaml
-name: Data Quality Check
+**Workflow Name**: Data Quality Check
 
-on:
-  schedule:
-    - cron: '0 6 * * *'
-  workflow_dispatch:
+**Triggers**:
+- Schedule: Daily at 6 AM UTC (`0 6 * * *`)
+- Manual: workflow_dispatch
 
-jobs:
-  quality-check:
-    runs-on: ubuntu-latest
-    
-    steps:
-      - uses: actions/checkout@v3
-      
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-      
-      - name: Install dependencies
-        run: |
-          pip install poetry
-          poetry install
-      
-      - name: Run Great Expectations
-        run: |
-          poetry run python -m src.data_quality.quality_runner
-      
-      - name: Upload results
-        uses: actions/upload-artifact@v3
-        with:
-          name: quality-results
-          path: src/data_quality/great_expectations/uncommitted/
-```
+**Job: quality-check** (ubuntu-latest)
+
+**Steps**:
+1. Checkout code
+2. Setup Python 3.10
+3. Install Poetry + dependencies
+4. Run Great Expectations (`python -m src.data_quality.quality_runner`)
+5. Upload results artifact (uncommitted/ directory)
 
 ---
 
@@ -467,96 +281,82 @@ jobs:
 
 **File**: `pytest.ini`
 
-```ini
-[pytest]
-testpaths = tests
-python_files = test_*.py
-python_classes = Test*
-python_functions = test_*
-addopts =
-    -v
-    --strict-markers
-    --tb=short
-    --cov=src
-    --cov-report=term-missing
-    --cov-report=html
-    --cov-fail-under=80
+**Configuration**:
+- Test paths: `tests/`
+- File pattern: `test_*.py`
+- Class pattern: `Test*`
+- Function pattern: `test_*`
 
-markers =
-    unit: Unit tests
-    integration: Integration tests
-    e2e: End-to-end tests
-    slow: Slow running tests
-```
+**Options** (addopts):
+- `-v`: Verbose output
+- `--strict-markers`: Fail on undefined markers
+- `--tb=short`: Short traceback format
+- `--cov=src`: Coverage for src/ directory
+- `--cov-report=term-missing`: Show missing lines
+- `--cov-report=html`: Generate HTML coverage report
+- `--cov-fail-under=80`: Fail if coverage <80%
 
-**File**: `pyproject.toml` (add testing dependencies)
-
-```toml
-[tool.poetry.group.dev.dependencies]
-pytest = "^7.4.0"
-pytest-cov = "^4.1.0"
-pytest-mock = "^3.12.0"
-pytest-asyncio = "^0.21.0"
-black = "^23.11.0"
-isort = "^5.12.0"
-flake8 = "^6.1.0"
-mypy = "^1.7.0"
-pre-commit = "^3.5.0"
-
-[tool.black]
-line-length = 100
-target-version = ['py310']
-include = '\.pyi?$'
-
-[tool.isort]
-profile = "black"
-line_length = 100
-
-[tool.mypy]
-python_version = "3.10"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = true
-```
+**Custom Markers**:
+- `unit`: Unit tests
+- `integration`: Integration tests
+- `e2e`: End-to-end tests
+- `slow`: Slow running tests
 
 ---
 
-### 8.7 Makefile Updates
+**File**: `pyproject.toml`
 
-```makefile
-.PHONY: test test-unit test-integration test-e2e coverage lint format
+**Development Dependencies to Add**:
+- pytest: ^7.4.0
+- pytest-cov: ^4.1.0 (coverage plugin)
+- pytest-mock: ^3.12.0 (mocking support)
+- pytest-asyncio: ^0.21.0 (async test support)
+- black: ^23.11.0
+- isort: ^5.12.0
+- flake8: ^6.1.0
+- mypy: ^1.7.0
+- pre-commit: ^3.5.0
 
-test:
-	poetry run pytest tests/ -v
+**Tool Configurations**:
 
-test-unit:
-	poetry run pytest tests/unit/ -v -m unit
+- `[tool.black]`: line-length=100, target-version=['py310']
+- `[tool.isort]`: profile="black", line_length=100
+- `[tool.mypy]`: python_version="3.10", warn_return_any=true, disallow_untyped_defs=true
 
-test-integration:
-	poetry run pytest tests/integration/ -v -m integration
+---
 
-test-e2e:
-	poetry run pytest tests/e2e/ -v -m e2e
+### 8.7 Makefile Automation
 
-coverage:
-	poetry run pytest tests/ --cov=src --cov-report=html --cov-report=term
+**File**: `Makefile`
 
-lint:
-	poetry run black --check src/ tests/
-	poetry run isort --check-only src/ tests/
-	poetry run flake8 src/ tests/
-	poetry run mypy src/
+**Targets to Add**:
 
-format:
-	poetry run black src/ tests/
-	poetry run isort src/ tests/
+- `test`: Run all tests
+  - Command: `poetry run pytest tests/ -v`
 
-pre-commit-install:
-	poetry run pre-commit install
+- `test-unit`: Run unit tests only
+  - Command: `poetry run pytest tests/unit/ -v -m unit`
 
-pre-commit-run:
-	poetry run pre-commit run --all-files
-```
+- `test-integration`: Run integration tests only
+  - Command: `poetry run pytest tests/integration/ -v -m integration`
+
+- `test-e2e`: Run E2E tests only
+  - Command: `poetry run pytest tests/e2e/ -v -m e2e`
+
+- `coverage`: Generate coverage reports (HTML + terminal)
+  - Command: `poetry run pytest tests/ --cov=src --cov-report=html --cov-report=term`
+
+- `lint`: Check code quality (Black, isort, Flake8, mypy)
+  - Commands: `black --check`, `isort --check-only`, `flake8`, `mypy src/`
+
+- `format`: Auto-format code
+  - Commands: `black src/ tests/`, `isort src/ tests/`
+
+- `pre-commit-install`: Install pre-commit hooks
+  - Command: `poetry run pre-commit install`
+
+- `pre-commit-run`: Run pre-commit on all files
+  - Command: `poetry run pre-commit run --all-files`
 
 ---
 

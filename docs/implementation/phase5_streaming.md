@@ -7,479 +7,541 @@
 
 ## Objectives
 
-- Implement Kinesis producer for real-time data ingestion
-- Build Flink streaming job for windowed aggregations
+- Implement real-time data ingestion with Kinesis
+- Build windowed stream aggregations with Flink
 - Store speed layer results in DynamoDB
-- Implement dead letter queue for failed messages
+- Implement fault tolerance with dead letter queue
 - Achieve <60s end-to-end latency
 
 ---
 
-## Tasks Breakdown
+## Architecture Overview
 
-### 5.1 Kinesis Producer
+```
+IoT Sensors → Kinesis Producer → Kinesis Stream → Consumer → DynamoDB
+                                      ↓
+                                 Flink Job (5-min windows)
+                                      ↓
+                              DynamoDB Aggregations
+                                      ↓
+                                  DLQ (failures)
+```
+
+**Lambda Architecture Speed Layer**: Real-time processing path complementing batch layer (Phases 3-4)
+
+---
+
+## Module Structure
+
+```
+src/ingestion/streaming/
+├── kinesis_producer.py      # Publishes messages to stream
+└── kinesis_consumer.py      # Reads from stream with error handling
+
+src/processing/streaming/
+├── dynamodb_writer.py       # Speed layer persistence
+└── stream_processor.py      # Orchestrates consumer → writer flow
+
+src/processing/flink/
+└── streaming_job.py         # Windowed aggregations
+```
+
+---
+
+## 5.1 Kinesis Producer
 
 **File**: `src/ingestion/streaming/kinesis_producer.py`
 
+**Responsibility**: Publish air quality measurements to Kinesis stream with idempotency guarantees (SRP)
+
+**Requirements**:
+- Use AWSClientFactory for client creation (DIP)
+- Partition by city_id for parallel processing
+- Add metadata: ingestion_timestamp, message_id
+- Support single and batch operations
+- Generate deterministic message_id from (city_id + timestamp) hash
+
+**Contract**:
 ```python
-import json
-import time
-from datetime import datetime
-from typing import Dict
-import hashlib
-
-from src.common.config import config
-from src.common.logger import setup_logger
-from src.common.aws_client import AWSClientFactory
-
-logger = setup_logger(__name__)
-
-
 class KinesisProducer:
-    
     def __init__(self):
-        self.client = AWSClientFactory.create_kinesis_client()
-        self.stream_name = config.kinesis.stream_name
-        self.batch_size = 500
-        self.batch = []
+        ...
     
-    def _generate_partition_key(self, record: Dict) -> str:
-        return record.get("city_id", "default")
+    def put_record(self, record: Dict) -> Dict:
+        ...
     
-    def put_record(self, record: Dict):
-        try:
-            record_with_metadata = {
-                **record,
-                "ingestion_timestamp": datetime.utcnow().isoformat(),
-                "message_id": self._generate_message_id(record)
-            }
-            
-            response = self.client.put_record(
-                StreamName=self.stream_name,
-                Data=json.dumps(record_with_metadata),
-                PartitionKey=self._generate_partition_key(record)
-            )
-            
-            logger.debug(f"Record sent: {response['SequenceNumber']}")
-            return response
-            
-        except Exception as e:
-            logger.error(f"Failed to send record: {e}")
-            raise
+    def put_records_batch(self, records: List[Dict]) -> Dict:
+        ...
     
-    def put_records_batch(self, records: list[Dict]):
-        if not records:
-            return
-        
-        kinesis_records = [
-            {
-                "Data": json.dumps({
-                    **record,
-                    "ingestion_timestamp": datetime.utcnow().isoformat(),
-                    "message_id": self._generate_message_id(record)
-                }),
-                "PartitionKey": self._generate_partition_key(record)
-            }
-            for record in records
-        ]
-        
-        try:
-            response = self.client.put_records(
-                StreamName=self.stream_name,
-                Records=kinesis_records
-            )
-            
-            failed_count = response.get("FailedRecordCount", 0)
-            if failed_count > 0:
-                logger.warning(f"{failed_count} records failed to send")
-            
-            logger.info(f"Batch sent: {len(records) - failed_count}/{len(records)} successful")
-            return response
-            
-        except Exception as e:
-            logger.error(f"Failed to send batch: {e}")
-            raise
+    @staticmethod
+    def _generate_partition_key(record: Dict) -> str:
+        ...
     
     @staticmethod
     def _generate_message_id(record: Dict) -> str:
-        content = f"{record.get('city_id')}_{record.get('timestamp')}"
-        return hashlib.sha256(content.encode()).hexdigest()[:16]
+        ...
 ```
+
+**Idempotency Pattern**: message_id enables duplicate detection downstream
 
 ---
 
-### 5.2 Kinesis Consumer
+## 5.2 Kinesis Consumer
 
 **File**: `src/ingestion/streaming/kinesis_consumer.py`
 
+**Responsibility**: Continuously poll Kinesis shards and delegate processing (SRP)
+
+**Requirements**:
+- Accept processor callback via constructor (Strategy Pattern, DIP)
+- Manage shard iterators across all shards
+- Handle deserialization errors gracefully
+- Send failed records to DLQ
+- Support graceful shutdown (KeyboardInterrupt)
+- Poll limit: 100 records per shard per iteration
+
+**Contract**:
 ```python
-import json
-import time
-from typing import Callable, Dict
-from botocore.exceptions import ClientError
-
-from src.common.config import config
-from src.common.logger import setup_logger
-from src.common.aws_client import AWSClientFactory
-
-logger = setup_logger(__name__)
-
-
 class KinesisConsumer:
-    
     def __init__(self, processor: Callable[[Dict], None]):
-        self.client = AWSClientFactory.create_kinesis_client()
-        self.stream_name = config.kinesis.stream_name
-        self.processor = processor
-        self.shard_iterators = {}
+        ...
+    
+    def consume(self, duration_seconds: Optional[int] = None) -> None:
+        ...
     
     def _get_shard_iterator(self, shard_id: str) -> str:
-        if shard_id not in self.shard_iterators:
-            response = self.client.get_shard_iterator(
-                StreamName=self.stream_name,
-                ShardId=shard_id,
-                ShardIteratorType="LATEST"
-            )
-            self.shard_iterators[shard_id] = response["ShardIterator"]
-        
-        return self.shard_iterators[shard_id]
+        ...
     
-    def _process_record(self, record: Dict):
-        try:
-            data = json.loads(record["Data"])
-            self.processor(data)
-        except Exception as e:
-            logger.error(f"Failed to process record: {e}")
-            self._send_to_dlq(record, str(e))
+    def _process_record(self, record: Dict) -> None:
+        ...
     
-    def _send_to_dlq(self, record: Dict, error: str):
-        dynamodb = AWSClientFactory.create_dynamodb_client()
-        
-        try:
-            dynamodb.put_item(
-                TableName=config.dynamodb.dlq_table,
-                Item={
-                    "error_id": {"S": record.get("message_id", "unknown")},
-                    "error_timestamp": {"S": str(int(time.time()))},
-                    "error_message": {"S": error},
-                    "record_data": {"S": json.dumps(record)}
-                }
-            )
-            logger.info("Record sent to DLQ")
-        except Exception as dlq_error:
-            logger.error(f"Failed to send to DLQ: {dlq_error}")
-    
-    def consume(self, duration_seconds: int | None = None):
-        logger.info("Starting Kinesis consumer")
-        
-        shards_response = self.client.list_shards(StreamName=self.stream_name)
-        shards = shards_response["Shards"]
-        
-        logger.info(f"Found {len(shards)} shards")
-        
-        start_time = time.time()
-        
-        try:
-            while True:
-                for shard in shards:
-                    shard_id = shard["ShardId"]
-                    shard_iterator = self._get_shard_iterator(shard_id)
-                    
-                    try:
-                        response = self.client.get_records(
-                            ShardIterator=shard_iterator,
-                            Limit=100
-                        )
-                        
-                        records = response.get("Records", [])
-                        
-                        for record in records:
-                            self._process_record(record)
-                        
-                        self.shard_iterators[shard_id] = response.get("NextShardIterator")
-                        
-                        if records:
-                            logger.info(f"Processed {len(records)} records from {shard_id}")
-                    
-                    except ClientError as e:
-                        logger.error(f"Error reading from shard {shard_id}: {e}")
-                
-                if duration_seconds and (time.time() - start_time) > duration_seconds:
-                    break
-                
-                time.sleep(1)
-        
-        except KeyboardInterrupt:
-            logger.info("Consumer stopped by user")
+    def _send_to_dlq(self, record: Dict, error: str) -> None:
+        ...
 ```
+
+**Error Handling**:
+- Deserialization failures → DLQ
+- Processing exceptions → DLQ
+- Shard read errors → Logged, continue to next shard
+
+**DLQ Schema** (DynamoDB):
+- Partition key: error_id (message_id or generated)
+- Attributes: error_timestamp, error_message, record_data (JSON)
 
 ---
 
-### 5.3 Flink Streaming Job
-
-**File**: `src/processing/flink/streaming_job.py`
-
-```python
-from pyflink.datastream import StreamExecutionEnvironment
-from pyflink.datastream.connectors.kinesis import FlinkKinesisConsumer
-from pyflink.datastream.window import TumblingProcessingTimeWindows
-from pyflink.common.time import Time
-from pyflink.common.serialization import SimpleStringSchema
-from pyflink.common.typeinfo import Types
-import json
-
-from src.common.config import config
-from src.common.logger import setup_logger
-
-logger = setup_logger(__name__)
-
-
-class FlinkStreamingJob:
-    
-    def __init__(self):
-        self.env = StreamExecutionEnvironment.get_execution_environment()
-        self.env.set_parallelism(2)
-    
-    def create_kinesis_source(self):
-        consumer_config = {
-            "aws.region": config.kinesis.region,
-            "aws.endpoint": config.kinesis.endpoint_url,
-            "aws.credentials.provider": "BASIC",
-            "aws.credentials.provider.basic.accesskeyid": "test",
-            "aws.credentials.provider.basic.secretkey": "test",
-        }
-        
-        return FlinkKinesisConsumer(
-            config.kinesis.stream_name,
-            SimpleStringSchema(),
-            consumer_config
-        )
-    
-    def parse_json(self, value: str):
-        try:
-            return json.loads(value)
-        except:
-            return None
-    
-    def calculate_window_aggregates(self, records):
-        city_id = records[0]["city_id"]
-        
-        pm25_values = [r["pm25_value"] for r in records]
-        aqi_values = [r["aqi_value"] for r in records]
-        
-        return {
-            "city_id": city_id,
-            "window_start": records[0]["timestamp"],
-            "window_end": records[-1]["timestamp"],
-            "avg_pm25": sum(pm25_values) / len(pm25_values),
-            "max_pm25": max(pm25_values),
-            "avg_aqi": sum(aqi_values) / len(aqi_values),
-            "max_aqi": max(aqi_values),
-            "record_count": len(records)
-        }
-    
-    def run(self):
-        logger.info("Starting Flink streaming job")
-        
-        kinesis_source = self.create_kinesis_source()
-        
-        stream = self.env.add_source(kinesis_source)
-        
-        parsed_stream = stream.map(
-            lambda x: self.parse_json(x),
-            output_type=Types.PICKLED_BYTE_ARRAY()
-        ).filter(lambda x: x is not None)
-        
-        windowed_stream = (
-            parsed_stream
-            .key_by(lambda x: x["city_id"])
-            .window(TumblingProcessingTimeWindows.of(Time.minutes(5)))
-            .reduce(
-                lambda a, b: {
-                    **a,
-                    "pm25_value": (a["pm25_value"] + b["pm25_value"]) / 2,
-                    "aqi_value": max(a["aqi_value"], b["aqi_value"])
-                }
-            )
-        )
-        
-        windowed_stream.print()
-        
-        self.env.execute("Air Quality Streaming Job")
-
-
-def main():
-    job = FlinkStreamingJob()
-    job.run()
-
-
-if __name__ == "__main__":
-    main()
-```
-
----
-
-### 5.4 DynamoDB Speed Layer Writer
+## 5.3 DynamoDB Speed Layer Writer
 
 **File**: `src/processing/streaming/dynamodb_writer.py`
 
+**Responsibility**: Persist real-time measurements with automatic expiration (SRP)
+
+**Requirements**:
+- Write to realtime_table with TTL (24 hours)
+- Store: city_id (PK), timestamp (SK), all measurement fields
+- Use Decimal type for numeric precision
+- Query latest N measurements by city
+
+**Contract**:
 ```python
-import time
-from typing import Dict
-from decimal import Decimal
-
-from src.common.config import config
-from src.common.logger import setup_logger
-from src.common.aws_client import AWSClientFactory
-
-logger = setup_logger(__name__)
-
-
 class DynamoDBSpeedLayerWriter:
-    
     def __init__(self):
-        self.client = AWSClientFactory.create_dynamodb_client()
-        self.table_name = config.dynamodb.realtime_table
-        self.ttl_hours = 24
+        ...
     
-    def write_measurement(self, measurement: Dict):
-        ttl = int(time.time()) + (self.ttl_hours * 3600)
-        
-        item = {
-            "city_id": {"S": measurement["city_id"]},
-            "timestamp": {"N": str(int(time.time()))},
-            "city_name": {"S": measurement["city_name"]},
-            "pm25_value": {"N": str(Decimal(str(measurement["pm25_value"])))},
-            "pm10_value": {"N": str(Decimal(str(measurement["pm10_value"])))},
-            "aqi_value": {"N": str(measurement["aqi_value"])},
-            "aqi_category": {"S": measurement["aqi_category"]},
-            "temperature_c": {"N": str(Decimal(str(measurement["temperature_c"])))},
-            "ttl": {"N": str(ttl)}
-        }
-        
-        try:
-            self.client.put_item(
-                TableName=self.table_name,
-                Item=item
-            )
-            logger.debug(f"Wrote measurement for {measurement['city_id']}")
-        except Exception as e:
-            logger.error(f"Failed to write to DynamoDB: {e}")
-            raise
+    def write_measurement(self, measurement: Dict) -> None:
+        ...
     
-    def get_latest_measurements(self, city_id: str, limit: int = 10):
-        try:
-            response = self.client.query(
-                TableName=self.table_name,
-                KeyConditionExpression="city_id = :city_id",
-                ExpressionAttributeValues={
-                    ":city_id": {"S": city_id}
-                },
-                ScanIndexForward=False,
-                Limit=limit
-            )
-            
-            return response.get("Items", [])
-        except Exception as e:
-            logger.error(f"Failed to query DynamoDB: {e}")
-            raise
+    def get_latest_measurements(self, city_id: str, limit: int = 10) -> List[Dict]:
+        ...
+```
+
+**Item Schema**:
+```python
+{
+    "city_id": {"S": "NYC001"},
+    "timestamp": {"N": "1699999999"},
+    "pm25_value": {"N": "45.3"},
+    "aqi_value": {"N": "125"},
+    "ttl": {"N": "1700086399"}
+}
 ```
 
 ---
 
-### 5.5 Integration Script
+## 5.4 Stream Processor (Orchestration)
 
 **File**: `src/processing/streaming/stream_processor.py`
 
+**Responsibility**: Wire consumer and writer together (Facade Pattern)
+
+**Requirements**:
+- Instantiate DynamoDBSpeedLayerWriter
+- Pass processing callback to KinesisConsumer
+- Filter duplicate messages (check is_duplicate flag)
+- Main entry point for streaming execution
+
+**Contract**:
 ```python
-from src.ingestion.streaming.kinesis_consumer import KinesisConsumer
-from src.processing.streaming.dynamodb_writer import DynamoDBSpeedLayerWriter
-from src.common.logger import setup_logger
-
-logger = setup_logger(__name__)
-
-
 class StreamProcessor:
-    
     def __init__(self):
-        self.dynamodb_writer = DynamoDBSpeedLayerWriter()
+        ...
     
-    def process_message(self, message: dict):
-        logger.debug(f"Processing message for {message.get('city_id')}")
-        
-        if message.get("is_duplicate"):
-            logger.warning("Duplicate message detected, skipping")
-            return
-        
-        self.dynamodb_writer.write_measurement(message)
+    def process_message(self, message: Dict) -> None:
+        ...
     
-    def run(self):
-        consumer = KinesisConsumer(processor=self.process_message)
-        consumer.consume()
+    def run(self) -> None:
+        ...
+```
 
+**Flow**: Consumer polls → process_message → Writer persists
 
-def main():
-    processor = StreamProcessor()
-    processor.run()
+---
 
+## 5.5 Flink Streaming Job
 
-if __name__ == "__main__":
-    main()
+**File**: `src/processing/flink/streaming_job.py`
+
+**Responsibility**: Windowed aggregations over streaming data
+
+**Requirements**:
+- Read from Kinesis using FlinkKinesisConsumer
+- Parse JSON messages, filter invalid
+- Key by city_id for stateful processing
+- Tumbling windows: 5 minutes
+- Aggregations per window: avg_pm25, max_pm25, avg_aqi, max_aqi, record_count
+- Output to stdout (extensible to DynamoDB sink)
+- Parallelism: 2
+
+**Contract**:
+```python
+class FlinkStreamingJob:
+    def __init__(self):
+        ...
+    
+    def create_kinesis_source(self) -> FlinkKinesisConsumer:
+        ...
+    
+    def run(self) -> None:
+        ...
+```
+
+**Window Output Schema**:
+```python
+{
+    "city_id": "NYC001",
+    "window_start": "2024-11-03T10:00:00Z",
+    "window_end": "2024-11-03T10:05:00Z",
+    "avg_pm25": 42.5,
+    "max_pm25": 58.3,
+    "record_count": 300
+}
 ```
 
 ---
 
-### 5.6 Makefile Updates
+## Design Patterns Applied
 
+### Strategy Pattern (Behavioral)
+**Location**: KinesisConsumer constructor
+
+**Implementation**: Consumer accepts processor callback via dependency injection
+```python
+KinesisConsumer(processor: Callable[[Dict], None])
+```
+
+**Benefit**: 
+- Decouple message consumption from processing logic (OCP)
+- Easy to swap processing strategies without modifying consumer
+- Testable in isolation with mock processors
+
+### Facade Pattern (Structural)
+**Location**: StreamProcessor class
+
+**Implementation**: Simplified interface for complex streaming subsystem
+```python
+processor = StreamProcessor()
+processor.run()
+```
+
+**Benefit**:
+- Hide complexity of consumer-writer coordination
+- Single entry point for streaming pipeline
+- Easier to understand and use
+
+### Template Method Pattern (Behavioral)
+**Location**: FlinkStreamingJob
+
+**Implementation**: Define algorithm skeleton (setup → source → transform → sink → execute)
+
+**Benefit**:
+- Reusable streaming job structure
+- Consistent execution flow across different jobs
+- Override specific steps without changing overall algorithm
+
+---
+
+## SOLID Principles Applied
+
+### Single Responsibility Principle (SRP)
+- **KinesisProducer**: Only publishes to stream
+- **KinesisConsumer**: Only reads from stream and delegates processing
+- **DynamoDBSpeedLayerWriter**: Only persists to DynamoDB
+- **StreamProcessor**: Only coordinates consumer and writer
+- **FlinkStreamingJob**: Only windowed aggregations
+
+Each class has one reason to change (one axis of responsibility)
+
+### Open/Closed Principle (OCP)
+- Add new processors without modifying KinesisConsumer (pass different callback)
+- Extend FlinkStreamingJob with new aggregation logic without changing base structure
+- Add new sinks by creating new writer classes
+
+### Liskov Substitution Principle (LSP)
+- Any Callable[[Dict], None] can be used as processor in KinesisConsumer
+- Writers can be swapped (DynamoDB, S3, Redis) if they implement same interface
+
+### Interface Segregation Principle (ISP)
+- KinesisConsumer only requires processor interface: single method callback
+- DynamoDBSpeedLayerWriter exposes minimal interface: write and query
+- No forced implementation of unused methods
+
+### Dependency Inversion Principle (DIP)
+- All classes depend on abstractions (AWSClientFactory, config)
+- StreamProcessor depends on processor abstraction, not concrete implementation
+- High-level modules (StreamProcessor) don't depend on low-level details (DynamoDB client)
+
+---
+
+## Data Engineering Patterns Applied
+
+### Idempotency
+- **message_id**: Deterministic hash from (city_id + timestamp) enables duplicate detection
+- **DynamoDB writes**: Same message_id overwrites, not duplicates
+- **Replayability**: Consumer can reprocess same data safely
+
+### Dead Letter Queue (DLQ)
+- **Purpose**: Capture failed messages for later analysis/replay
+- **Implementation**: DynamoDB table with error context
+- **Benefit**: No data loss, debugging visibility
+
+### Watermarking
+- **ingestion_timestamp**: Track when data entered system
+- **Latency calculation**: Compare ingestion_timestamp to processing time
+- **SLA monitoring**: Detect processing delays
+
+### Partitioning
+- **city_id as partition key**: Parallel processing across cities
+- **Benefit**: Horizontal scalability, no cross-partition transactions
+
+### Windowing
+- **Tumbling windows (5 minutes)**: Non-overlapping time buckets
+- **Aggregation**: Summarize high-frequency data to reduce downstream load
+- **Benefit**: Real-time insights with bounded memory
+
+---
+
+## Configuration Management
+
+**File**: `config/config.yaml`
+
+Add streaming-specific configuration:
+```yaml
+kinesis:
+  endpoint_url: http://localhost:4566
+  stream_name: air-quality-measurements
+  region: us-east-1
+  
+dynamodb:
+  endpoint_url: http://localhost:4566
+  realtime_table: air-quality-realtime
+  dlq_table: air-quality-dlq
+  region: us-east-1
+  ttl_hours: 24
+
+flink:
+  parallelism: 2
+  window_minutes: 5
+```
+
+---
+
+## Automation Commands
+
+**File**: `Makefile`
+
+Add streaming targets:
 ```makefile
-.PHONY: stream-producer stream-consumer
+.PHONY: stream-producer stream-consumer flink-job
 
 stream-producer:
 	poetry run python -m src.data_generation.stream_simulator --mode=$(MODE)
 
 stream-consumer:
 	poetry run python -m src.processing.streaming.stream_processor
+
+flink-job:
+	poetry run python -m src.processing.flink.streaming_job
+```
+
+**Usage**:
+```bash
+make stream-producer MODE=development
+make stream-consumer
+make flink-job
+```
+
+**Usage**:
+```bash
+make stream-producer MODE=development
+make stream-consumer
+make flink-job
 ```
 
 ---
 
-## Validation Steps
+## Validation Criteria
 
-### 1. Start Stream Producer
-```bash
-make stream-producer MODE=development
-```
+### 1. End-to-End Latency Test
 
-### 2. Start Stream Consumer
-```bash
-make stream-consumer
-```
+**Objective**: Verify <60s from sensor to DynamoDB
 
-### 3. Verify DynamoDB Writes
+**Steps**:
+1. Start consumer: `make stream-consumer`
+2. Start producer: `make stream-producer MODE=development`
+3. Monitor logs for ingestion_timestamp and processing_at
+4. Calculate difference: processing_at - ingestion_timestamp
+
+**Success**: 95th percentile <60s
+
+### 2. Message Throughput Test
+
+**Objective**: Handle 33 msgs/sec (production mode)
+
+**Steps**:
+1. Start producer in production: `make stream-producer MODE=production`
+2. Monitor Kinesis metrics: IncomingRecords, IncomingBytes
+3. Verify consumer keeps up (no shard iterator lag)
+
+**Success**: Consumer processes all records within 5 minutes of ingestion
+
+### 3. DLQ Functionality Test
+
+**Objective**: Failed records captured in DLQ
+
+**Steps**:
+1. Inject malformed JSON into stream
+2. Verify consumer logs error
+3. Query DLQ table:
 ```bash
 aws --endpoint-url=http://localhost:4566 dynamodb scan \
-    --table-name air-quality-realtime \
-    --limit 10
+    --table-name air-quality-dlq \
+    --max-items 10
 ```
 
-### 4. Check Latency
-Monitor time between producer timestamp and DynamoDB write (target: <60s)
+**Success**: Error record present with error_message and record_data
+
+### 4. Flink Window Aggregation Test
+
+**Objective**: 5-minute windows produce correct aggregates
+
+**Steps**:
+1. Start Flink job: `make flink-job`
+2. Wait for 2 complete windows (10 minutes)
+3. Verify stdout output contains window_start, window_end, aggregations
+4. Validate: avg_pm25 < max_pm25, record_count > 0
+
+**Success**: Valid aggregations printed every 5 minutes
+
+### 5. DynamoDB Query Test
+
+**Objective**: Retrieve latest measurements by city
+
+**Steps**:
+1. Insert 20 measurements for NYC001
+2. Query using DynamoDBSpeedLayerWriter.get_latest_measurements("NYC001", 5)
+3. Verify returns 5 most recent records, sorted by timestamp descending
+
+**Success**: Correct count and ordering
+
+### 6. Idempotency Test
+
+**Objective**: Duplicate messages don't create duplicate records
+
+**Steps**:
+1. Send same measurement twice (same city_id + timestamp)
+2. Query DynamoDB for city_id + timestamp combination
+3. Verify only 1 record exists
+
+**Success**: Deduplication works via message_id
+
+---
+
+## Monitoring Metrics
+
+Track these metrics for SLA compliance:
+
+| Metric | Target | Measurement |
+|--------|--------|-------------|
+| End-to-end latency | <60s | ingestion_timestamp → DynamoDB write |
+| Throughput | 33 msgs/sec | Kinesis IncomingRecords/sec |
+| Error rate | <0.5% | DLQ writes / total messages |
+| Consumer lag | <30s | Shard iterator age |
+| DynamoDB write latency | <100ms | PutItem duration |
 
 ---
 
 ## Deliverables Checklist
 
-- [ ] Kinesis producer implemented
-- [ ] Kinesis consumer with DLQ support
-- [ ] Flink streaming job (5-min windows)
-- [ ] DynamoDB speed layer writer
-- [ ] Stream processor integration
-- [ ] End-to-end streaming working
-- [ ] Latency <60 seconds
-- [ ] DLQ capturing failed messages
+- [ ] KinesisProducer with batching support
+- [ ] KinesisConsumer with DLQ error handling
+- [ ] DynamoDBSpeedLayerWriter with TTL
+- [ ] StreamProcessor orchestration
+- [ ] FlinkStreamingJob with 5-min windows
+- [ ] Configuration updated (kinesis, dynamodb, flink)
+- [ ] Makefile automation commands
+- [ ] End-to-end latency <60s validated
+- [ ] DLQ capturing failures
+- [ ] Throughput test passing (33 msgs/sec)
+
+---
+
+## Technical Debt & Future Improvements
+
+**Current Limitations**:
+- Flink job outputs to stdout (not DynamoDB)
+- No checkpointing for consumer state recovery
+- Single consumer instance (no horizontal scaling)
+- No backpressure handling
+
+**Future Enhancements** (YAGNI - implement only when needed):
+- DynamoDB sink for Flink aggregations
+- Consumer checkpointing with DynamoDB state table
+- Auto-scaling consumer fleet with ECS/Fargate
+- Rate limiting and backpressure
+
+---
+
+## Integration with Batch Layer
+
+**Lambda Architecture**: Speed layer complements batch layer
+
+| Layer | Latency | Scope | Technology |
+|-------|---------|-------|------------|
+| **Batch** | Hours | Complete historical data | Spark + Delta Lake |
+| **Speed** | Seconds | Last 24 hours | Kinesis + Flink + DynamoDB |
+| **Serving** | Merge both | Query interface | PostgreSQL + DynamoDB |
+
+**Query Pattern**:
+```python
+recent = dynamodb.query(city_id, last_24h)
+historical = postgresql.query(city_id, older_than_24h)
+combined = recent + historical
+```
 
 ---
 
 ## Next Phase
 
-Proceed to [Phase 6: Data Quality Framework](./phase6_data_quality.md)
+[Phase 6: Data Quality Framework](./phase6_data_quality.md)
+
+**Prerequisites from this phase**: Streaming pipeline operational, DynamoDB populated
