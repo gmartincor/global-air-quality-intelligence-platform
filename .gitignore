@@ -1,0 +1,116 @@
+# Project documentation (private)
+PROJECT_PROMPT.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# PyCharm
+.idea/
+
+# VSCode
+.vscode/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+coverage.xml
+*.cover
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!environments/*.tfvars
+.terraform.lock.hcl
+
+# Docker
+*.log
+docker-compose.override.yml
+
+# Data files
+data/
+*.parquet
+*.csv
+*.json
+!config/*.json
+!infrastructure/**/*.json
+
+# Airflow
+airflow-logs/
+airflow.db
+airflow.cfg
+webserver_config.py
+
+# Spark
+metastore_db/
+derby.log
+spark-warehouse/
+
+# dbt
+target/
+dbt_packages/
+logs/
+
+# Great Expectations
+uncommitted/
+validations/
+
+# LocalStack
+localstack-data/
+.localstack/
+
+# Environment variables
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
+
+# IDE
+*.sublime-project
+*.sublime-workspace
