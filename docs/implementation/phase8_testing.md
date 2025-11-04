@@ -253,7 +253,7 @@
 
 **Steps**:
 1. Checkout code
-2. Build Docker images (airflow.Dockerfile)
+2. Build Docker images (Dockerfile with multi-stage builds)
 3. Run security scan (Trivy on built image)
 
 ---

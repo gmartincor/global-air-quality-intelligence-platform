@@ -1,0 +1,19 @@
+environment: dev
+
+aws:
+  endpoint_url: http://localhost:4566
+  region: us-east-1
+  access_key_id: test
+  secret_access_key: test
+
+postgres:
+  host: localhost
+  port: 5432
+  database: airflow
+  user: airflow
+  password: airflow
+
+redis:
+  host: localhost
+  port: 6379
+  db: 0

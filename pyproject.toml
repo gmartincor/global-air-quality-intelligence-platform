@@ -1,0 +1,71 @@
+[tool.poetry]
+name = "global-air-quality"
+version = "0.1.0"
+description = "Real-time and batch data pipeline for air quality monitoring with Lambda Architecture"
+authors = ["Guillermo Martin Correa"]
+readme = "README.md"
+packages = [{include = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+pyspark = "^3.5.0"
+delta-spark = "^3.0.0"
+boto3 = "^1.34.0"
+boto3-stubs = {extras = ["s3", "kinesis", "dynamodb"], version = "^1.34.0"}
+pydantic = "^2.5.0"
+pydantic-settings = "^2.1.0"
+pyyaml = "^6.0.1"
+apache-airflow = "^2.7.0"
+apache-airflow-providers-apache-spark = "^4.5.0"
+apache-airflow-providers-amazon = "^8.14.0"
+pandas = "^2.1.0"
+numpy = "^1.26.0"
+faker = "^20.1.0"
+psycopg2-binary = "^2.9.9"
+redis = "^5.0.1"
+great-expectations = "^0.18.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.0"
+pytest-cov = "^4.1.0"
+black = "^23.11.0"
+isort = "^5.12.0"
+flake8 = "^6.1.0"
+mypy = "^1.7.0"
+pre-commit = "^3.5.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+exclude = '''
+/(
+    \.git
+  | \.venv
+  | \.eggs
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 100
+skip_gitignore = true
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = "-v --cov=src --cov-report=term-missing"

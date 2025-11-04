@@ -1,0 +1,40 @@
+environment: dev
+
+aws:
+  endpoint_url: http://localstack:4566
+  region: us-east-1
+  access_key_id: test
+  secret_access_key: test
+
+s3:
+  bronze_bucket: dev-air-quality-bronze
+  silver_bucket: dev-air-quality-silver
+  gold_bucket: dev-air-quality-gold
+
+kinesis:
+  stream_name: air-quality-measurements
+  shard_count: 1
+
+dynamodb:
+  speed_layer_table: air-quality-realtime
+  dlq_table: air-quality-dlq
+
+postgres:
+  host: postgres
+  port: 5432
+  database: airflow
+  user: airflow
+  password: airflow
+
+redis:
+  host: redis
+  port: 6379
+  db: 0
+
+airflow:
+  dags_folder: /opt/airflow/dags
+  executor: CeleryExecutor
+
+spark:
+  master_url: spark://spark-master:7077
+  app_name: air-quality-processing

@@ -129,10 +129,12 @@ class AWSClientFactory:
 - Volumes: Persist LocalStack data, PostgreSQL data, Airflow logs
 - Airflow executor: CeleryExecutor
 
-**Custom Dockerfile** (`airflow.Dockerfile`):
-- Base: `apache/airflow:2.7.0-python3.10`
-- Add: OpenJDK 11 for Spark integration
-- Install project dependencies
+**Unified Dockerfile** (`infrastructure/docker/Dockerfile`):
+- Multi-stage build with `dev` and `airflow` targets
+- Configurable base image via build args
+- Supports Java 11 (Airflow) and Java 17 (dev)
+- Install project dependencies via Poetry
+- Optimized layer caching
 
 ---
 

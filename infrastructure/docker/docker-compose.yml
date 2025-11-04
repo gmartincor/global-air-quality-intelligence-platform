@@ -1,0 +1,290 @@
+services:
+  dev:
+    build:
+      context: ../..
+      dockerfile: infrastructure/docker/Dockerfile
+      target: dev
+    container_name: air-quality-dev
+    platform: linux/amd64
+    environment:
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-test}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-test}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-airflow}
+      - POSTGRES_USER=${POSTGRES_USER:-airflow}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-airflow}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - SPARK_MASTER_URL=spark://spark-master:7077
+    volumes:
+      - ../..:/app
+      - dev-cache:/root/.cache
+    working_dir: /app
+    networks:
+      - air-quality-network
+    depends_on:
+      localstack:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+    command: sleep infinity
+
+  localstack:
+    image: localstack/localstack:latest
+    container_name: air-quality-localstack
+    platform: linux/amd64
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=s3,kinesis,dynamodb
+      - DEBUG=1
+      - DATA_DIR=/var/lib/localstack
+      - PERSISTENCE=1
+    volumes:
+      - localstack-data:/var/lib/localstack
+    networks:
+      - air-quality-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15
+    container_name: air-quality-postgres
+    platform: linux/amd64
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-airflow}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-airflow}
+      - POSTGRES_DB=${POSTGRES_DB:-airflow}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - air-quality-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-airflow}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: air-quality-redis
+    platform: linux/amd64
+    ports:
+      - "6379:6379"
+    networks:
+      - air-quality-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  airflow-init:
+    build:
+      context: ../..
+      dockerfile: infrastructure/docker/Dockerfile
+      target: airflow
+    container_name: air-quality-airflow-init
+    platform: linux/amd64
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    environment: &airflow-common-env
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres/${POSTGRES_DB:-airflow}
+      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres/${POSTGRES_DB:-airflow}
+      AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY:-air_quality_secret_key}
+    user: "${AIRFLOW_UID:-50000}:0"
+    volumes:
+      - ../../src:/opt/airflow/src
+      - ../../config:/opt/airflow/config
+    command: >
+      bash -c "airflow db migrate &&
+               airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com || true"
+    networks:
+      - air-quality-network
+    restart: on-failure
+
+  airflow-webserver:
+    build:
+      context: ../..
+      dockerfile: infrastructure/docker/Dockerfile
+      target: airflow
+    container_name: air-quality-airflow-webserver
+    platform: linux/amd64
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    environment:
+      <<: *airflow-common-env
+    ports:
+      - "8080:8080"
+    user: "${AIRFLOW_UID:-50000}:0"
+    volumes:
+      - ../../src/orchestration/airflow/dags:/opt/airflow/dags
+      - ../../src:/opt/airflow/src
+      - ../../config:/opt/airflow/config
+      - airflow-logs:/opt/airflow/logs
+    command: webserver
+    networks:
+      - air-quality-network
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  airflow-scheduler:
+    build:
+      context: ../..
+      dockerfile: infrastructure/docker/Dockerfile
+      target: airflow
+    container_name: air-quality-airflow-scheduler
+    platform: linux/amd64
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    environment:
+      <<: *airflow-common-env
+    user: "${AIRFLOW_UID:-50000}:0"
+    volumes:
+      - ../../src/orchestration/airflow/dags:/opt/airflow/dags
+      - ../../src:/opt/airflow/src
+      - ../../config:/opt/airflow/config
+      - airflow-logs:/opt/airflow/logs
+    command: scheduler
+    networks:
+      - air-quality-network
+    restart: unless-stopped
+
+  airflow-worker:
+    build:
+      context: ../..
+      dockerfile: infrastructure/docker/Dockerfile
+      target: airflow
+    container_name: air-quality-airflow-worker
+    platform: linux/amd64
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    environment:
+      <<: *airflow-common-env
+    user: "${AIRFLOW_UID:-50000}:0"
+    volumes:
+      - ../../src/orchestration/airflow/dags:/opt/airflow/dags
+      - ../../src:/opt/airflow/src
+      - ../../config:/opt/airflow/config
+      - airflow-logs:/opt/airflow/logs
+    command: celery worker
+    networks:
+      - air-quality-network
+    restart: unless-stopped
+
+  spark-master:
+    image: apache/spark:3.5.3-python3
+    container_name: air-quality-spark-master
+    platform: linux/amd64
+    environment:
+      - SPARK_MODE=master
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+      - SPARK_MASTER_WEBUI_PORT=8080
+    ports:
+      - "8081:8080"
+      - "7077:7077"
+    volumes:
+      - ../../src:/opt/spark-apps/src
+      - ../../config:/opt/spark-apps/config
+      - spark-logs:/opt/spark/logs
+    networks:
+      - air-quality-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    command: >
+      bash -c "mkdir -p /opt/spark/logs &&
+               /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master --host spark-master --port 7077 --webui-port 8080"
+    restart: unless-stopped
+
+  spark-worker:
+    image: apache/spark:3.5.3-python3
+    container_name: air-quality-spark-worker
+    platform: linux/amd64
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    volumes:
+      - ../../src:/opt/spark-apps/src
+      - ../../config:/opt/spark-apps/config
+      - spark-logs:/opt/spark/logs
+    networks:
+      - air-quality-network
+    command: >
+      bash -c "mkdir -p /opt/spark/logs &&
+               /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077 --memory 2G --cores 2"
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  airflow-logs:
+  spark-logs:
+  dev-cache:
+  localstack-data:
+
+networks:
+  air-quality-network:
+    driver: bridge
